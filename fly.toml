@@ -1,0 +1,7 @@
+app = "outsmart-bot"
+primary_region = "fra"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
