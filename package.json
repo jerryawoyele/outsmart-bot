@@ -1,0 +1,25 @@
+{
+  "name": "outsmart-rug-defense-bot",
+  "version": "1.0.0",
+  "description": "Bot that monitors dev liquidity removals and auto-sells positions",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@raydium-io/raydium-sdk-v2": "^0.2.32-alpha",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

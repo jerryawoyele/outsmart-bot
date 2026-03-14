@@ -1,0 +1,589 @@
+import WebSocket from 'ws';
+import { TokenPosition } from './types.js';
+
+/**
+ * Retry a function with exponential backoff
+ */
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000,
+  name: string = 'operation'
+): Promise<T> {
+  let lastError: Error | undefined;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+      if (attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        console.log(`[Helius] Retry ${attempt}/${maxRetries} for ${name} in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
+export interface HeliusWsConfig {
+  wsUrl: string;
+  rpcUrl: string;
+  onLiquidityRemoval?: (tokenMint: string, signature: string) => void;
+  onError?: (error: Error) => void;
+  onConnect?: () => void;
+}
+
+export interface LogNotification {
+  result: {
+    context: { slot: number };
+    value: {
+      signature: string;
+      err: any;
+      logs: string[];
+    };
+  };
+  subscription: number;
+}
+
+export interface AccountNotification {
+  result: {
+    context: { slot: number };
+    value: {
+      data: [string, string];
+      executable: boolean;
+      owner: string;
+      lamports: number;
+    };
+  };
+  subscription: number;
+}
+
+// SPL Token Account layout (165 bytes)
+// mint: 32 bytes offset 0
+// owner: 32 bytes offset 32
+// amount: 8 bytes offset 64
+const TOKEN_ACCOUNT_AMOUNT_OFFSET = 64;
+
+function decodeTokenAmount(data: string): bigint | null {
+  try {
+    const buf = Buffer.from(data, 'base64');
+    if (buf.length < 72) return null;
+    // amount is u64 at offset 64
+    return buf.readBigUInt64LE(TOKEN_ACCOUNT_AMOUNT_OFFSET);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Helius WebSocket client for monitoring dev token accounts
+ * Uses logsSubscribe to detect ANY transaction involving the account
+ * Also uses accountSubscribe to cache user token balances
+ */
+export class HeliusWsClient {
+  private ws: WebSocket | null = null;
+  private config: HeliusWsConfig;
+  private requestId = 0;
+  
+  // logsSubscribe for dev token accounts
+  private subscriptions: Map<number, { tokenAccount: string; position: TokenPosition }> = new Map();
+  private tokenAccountToSubId: Map<string, number> = new Map();
+  
+  // accountSubscribe for user token balance caching
+  private balanceSubscriptions: Map<number, string> = new Map(); // subId -> tokenAccount
+  private pendingBalanceSubs: Map<number, string> = new Map(); // requestId -> tokenAccount (placeholder)
+  private tokenAccountToBalanceSubId: Map<string, number> = new Map(); // tokenAccount -> subId
+  
+  // Cached balances: tokenAccount -> amount
+  private cachedBalances: Map<string, bigint> = new Map();
+  
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private reconnectDelay = 1000;
+  private isReconnecting = false;
+
+  constructor(config: HeliusWsConfig) {
+    this.config = config;
+  }
+
+  /**
+   * Get cached balance for a token account
+   */
+  getCachedBalance(tokenAccount: string): bigint | undefined {
+    return this.cachedBalances.get(tokenAccount);
+  }
+
+  /**
+   * Connect to Helius WebSocket
+   */
+  async connect(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(this.config.wsUrl);
+
+      this.ws.on('open', () => {
+        console.log('[Helius] WebSocket connected');
+        this.reconnectAttempts = 0;
+        this.config.onConnect?.();
+        resolve();
+      });
+
+      this.ws.on('message', (data: WebSocket.Data) => {
+        try {
+          const response = JSON.parse(data.toString());
+          
+          // Handle subscription confirmation
+          if (response.result !== undefined && response.id !== undefined) {
+            const requestId = response.id;
+            const subId = response.result;
+            
+            // Check if this is a balance subscription
+            const balanceTokenAccount = this.pendingBalanceSubs.get(requestId);
+            if (balanceTokenAccount) {
+              this.pendingBalanceSubs.delete(requestId);
+              this.balanceSubscriptions.set(subId, balanceTokenAccount);
+              this.tokenAccountToBalanceSubId.set(balanceTokenAccount, subId);
+              return;
+            }
+            
+            // Otherwise it's a logs subscription
+            const subInfo = this.subscriptions.get(requestId);
+            if (subInfo) {
+              this.subscriptions.delete(requestId);
+              this.subscriptions.set(subId, subInfo);
+              this.tokenAccountToSubId.set(subInfo.tokenAccount, subId);
+            }
+            return;
+          }
+
+          // Handle logs notifications
+          if (response.method === 'logsNotification') {
+            this.handleLogsNotification(response);
+          }
+          
+          // Handle account notifications (for balance caching)
+          if (response.method === 'accountNotification') {
+            this.handleAccountNotification(response);
+          }
+        } catch (err) {
+          console.error('[Helius] Failed to parse message:', err);
+        }
+      });
+
+      this.ws.on('error', (error: Error) => {
+        console.error('[Helius] WebSocket error:', error.message);
+        this.config.onError?.(error);
+        reject(error);
+      });
+
+      this.ws.on('close', () => {
+        console.log('[Helius] WebSocket closed');
+        this.attemptReconnect();
+      });
+    });
+  }
+
+  /**
+   * Handle account notification - update cached balance
+   */
+  private handleAccountNotification(response: { params: AccountNotification; subscription: number }): void {
+    const subId = response.params?.subscription;
+    const tokenAccount = this.balanceSubscriptions.get(subId);
+    
+    if (!tokenAccount) return;
+    
+    const accountData = response.params?.result?.value?.data;
+    if (accountData && Array.isArray(accountData)) {
+      const [data, encoding] = accountData;
+      if (encoding === 'base64' && data) {
+        const amount = decodeTokenAmount(data);
+        if (amount !== null) {
+          this.cachedBalances.set(tokenAccount, amount);
+        }
+      }
+    }
+  }
+
+  /**
+   * Handle logs notification - ANY transaction = SELL
+   */
+  private handleLogsNotification(response: { params: LogNotification; subscription: number }): void {
+    const subId = response.params?.subscription;
+    const subInfo = this.subscriptions.get(subId);
+    
+    if (!subInfo) return;
+    
+    const { position } = subInfo;
+    const signature = response.params?.result?.value?.signature;
+    
+    // Trigger sell - don't unsubscribe here, let caller handle after sell
+    this.config.onLiquidityRemoval?.(position.tokenMint, signature || '');
+  }
+
+  /**
+   * Subscribe to user's token account balance changes via accountSubscribe
+   */
+  subscribeToUserTokenBalance(tokenAccount: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+
+    // Check if already subscribed
+    if (this.tokenAccountToBalanceSubId.has(tokenAccount)) {
+      return;
+    }
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'accountSubscribe',
+      params: [
+        tokenAccount,
+        {
+          encoding: 'base64',
+          commitment: 'processed',
+        },
+      ],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    
+    // Store with requestId as placeholder
+    this.pendingBalanceSubs.set(this.requestId, tokenAccount);
+  }
+
+  /**
+   * Subscribe to logs mentioning the dev's token account
+   */
+  subscribeToTokenAccount(tokenAccount: string, position: TokenPosition): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'logsSubscribe',
+      params: [
+        {
+          mentions: [tokenAccount],
+        },
+        {
+          commitment: 'processed',
+        },
+      ],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    
+    // Store with requestId as placeholder, will be replaced with actual subId
+    this.subscriptions.set(this.requestId, { tokenAccount, position });
+    this.tokenAccountToSubId.set(tokenAccount, this.requestId);
+  }
+
+  /**
+   * Unsubscribe from a specific token account (when position is sold)
+   */
+  unsubscribeFromTokenAccount(tokenAccount: string): void {
+    // Unsubscribe from logs
+    for (const [actualSubId, info] of this.subscriptions) {
+      if (info.tokenAccount === tokenAccount) {
+        this.unsubscribeLogs(actualSubId);
+        this.tokenAccountToSubId.delete(tokenAccount);
+        break;
+      }
+    }
+    
+    // Unsubscribe from balance
+    const balanceSubId = this.tokenAccountToBalanceSubId.get(tokenAccount);
+    if (balanceSubId) {
+      this.unsubscribeAccount(balanceSubId);
+      this.balanceSubscriptions.delete(balanceSubId);
+      this.tokenAccountToBalanceSubId.delete(tokenAccount);
+      this.cachedBalances.delete(tokenAccount);
+    }
+  }
+
+  /**
+   * Unsubscribe from logs
+   */
+  private unsubscribeLogs(subscriptionId: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'logsUnsubscribe',
+      params: [subscriptionId],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    this.subscriptions.delete(subscriptionId);
+  }
+
+  /**
+   * Unsubscribe from account
+   */
+  private unsubscribeAccount(subscriptionId: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'accountUnsubscribe',
+      params: [subscriptionId],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    this.balanceSubscriptions.delete(subscriptionId);
+  }
+
+  /**
+   * Get user's token account for a specific mint via Helius HTTP RPC
+   */
+  async getUserTokenAccount(walletAddress: string, tokenMint: string): Promise<string | null> {
+    try {
+      const data = await retryWithBackoff(
+        async () => {
+          const response = await fetch(this.config.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: '1',
+              method: 'getTokenAccounts',
+              params: {
+                owner: walletAddress,
+                mint: tokenMint,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          return response.json() as Promise<{ result?: { token_accounts?: Array<{ address: string; amount?: number }> } }>;
+        },
+        3,
+        1000,
+        `getUserTokenAccount(${tokenMint.slice(0, 8)}...)`
+      );
+      
+      if (data.result?.token_accounts && data.result.token_accounts.length > 0) {
+        const acc = data.result.token_accounts[0];
+        // Seed the cache with initial balance
+        if (acc.amount !== undefined) {
+          this.cachedBalances.set(acc.address, BigInt(acc.amount));
+        }
+        return acc.address;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get user token account: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get dev's token account via Helius HTTP RPC
+   */
+  async getDevTokenAccount(devAddress: string, tokenMint: string): Promise<string | null> {
+    try {
+      const data = await retryWithBackoff(
+        async () => {
+          const response = await fetch(this.config.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: '1',
+              method: 'getTokenAccounts',
+              params: {
+                owner: devAddress,
+                mint: tokenMint,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          return response.json() as Promise<{ result?: { token_accounts?: Array<{ address: string }> } }>;
+        },
+        3,
+        1000,
+        `getDevTokenAccount(${tokenMint.slice(0, 8)}...)`
+      );
+      
+      if (data.result?.token_accounts && data.result.token_accounts.length > 0) {
+        return data.result.token_accounts[0].address;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get dev token account: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get pool address from dev token account's CLOSE_ACCOUNT transaction
+   */
+  async getPoolFromDevTokenAccount(devTokenAccount: string): Promise<string | null> {
+    try {
+      const heliusApiKey = this.config.rpcUrl.split('api-key=')[1];
+      if (!heliusApiKey) return null;
+
+      const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${devTokenAccount}/transactions?token-accounts=none&sort-order=asc&api-key=${heliusApiKey}&type=CLOSE_ACCOUNT&source=SOLANA_PROGRAM_LIBRARY`;
+
+      const response = await retryWithBackoff(
+        async () => {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res;
+        },
+        3,
+        1000,
+        `getPoolFromDevTokenAccount(${devTokenAccount.slice(0, 8)}...)`
+      );
+
+      const transactions = await response.json() as Array<{
+        type: string;
+        tokenTransfers?: Array<{
+          fromTokenAccount: string;
+          toTokenAccount: string;
+          fromUserAccount: string;
+          toUserAccount: string;
+          mint: string;
+        }>;
+      }>;
+
+      for (const tx of transactions) {
+        if (tx.tokenTransfers && tx.tokenTransfers.length >= 1) {
+          return tx.tokenTransfers[0].toUserAccount;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get pool: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get token accounts for wallet via Helius HTTP RPC
+   */
+  async getWalletTokenAccounts(walletAddress: string): Promise<Array<{ tokenAccount: string; mint: string; amount: string; decimals: number }>> {
+    try {
+      const data = await retryWithBackoff(
+        async () => {
+          const response = await fetch(this.config.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: '1',
+              method: 'getTokenAccounts',
+              params: {
+                owner: walletAddress,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          return response.json() as Promise<{ 
+            result?: { 
+              token_accounts?: Array<{ 
+                address: string;
+                mint: string; 
+                amount: number;
+              }> 
+            } 
+          }>;
+        },
+        3,
+        1000,
+        'getWalletTokenAccounts'
+      );
+      
+      if (data.result?.token_accounts) {
+        return data.result.token_accounts.map(acc => ({
+          tokenAccount: acc.address,
+          mint: acc.mint,
+          amount: acc.amount.toString(),
+          decimals: 6,
+        }));
+      }
+      
+      return [];
+    } catch (error) {
+      console.error(`[Helius] Failed to get wallet token accounts: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Attempt to reconnect with exponential backoff
+   */
+  private async attemptReconnect(): Promise<void> {
+    if (this.isReconnecting || this.reconnectAttempts >= this.maxReconnectAttempts) {
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+
+    console.log(`[Helius] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    try {
+      await this.connect();
+      
+      // Re-subscribe to logs
+      const toResubscribe = Array.from(this.subscriptions.values());
+      this.subscriptions.clear();
+      this.tokenAccountToSubId.clear();
+      for (const { tokenAccount, position } of toResubscribe) {
+        this.subscribeToTokenAccount(tokenAccount, position);
+      }
+      
+      // Re-subscribe to balance accounts
+      const balanceAccounts = Array.from(this.balanceSubscriptions.values());
+      this.balanceSubscriptions.clear();
+      this.tokenAccountToBalanceSubId.clear();
+      for (const tokenAccount of balanceAccounts) {
+        this.subscribeToUserTokenBalance(tokenAccount);
+      }
+      
+      this.isReconnecting = false;
+    } catch (err) {
+      this.isReconnecting = false;
+      console.error('[Helius] Reconnect failed:', err);
+    }
+  }
+
+  /**
+   * Disconnect from WebSocket
+   */
+  disconnect(): void {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+}
