@@ -13,6 +13,8 @@ interface BotConfig {
   privateKey: string;
   defaultSlippageBps?: number;
   defaultPriorityFeeLamports?: number;
+  broadcastFeeType?: 'maxCap' | 'exactFee';
+  jitoTipLamports?: number;
 }
 
 /**
@@ -296,6 +298,8 @@ class RugDefenseBot {
         sellPercent: 100,
         slippageBps: this.config.defaultSlippageBps,
         priorityFeeLamports: this.config.defaultPriorityFeeLamports,
+        broadcastFeeType: this.config.broadcastFeeType,
+        jitoTipLamports: this.config.jitoTipLamports,
       });
     } else {
       // Fallback to legacy method (will auto-prepare)
@@ -306,6 +310,8 @@ class RugDefenseBot {
         sellPercent: 100,
         slippageBps: this.config.defaultSlippageBps,
         priorityFeeLamports: this.config.defaultPriorityFeeLamports,
+        broadcastFeeType: this.config.broadcastFeeType,
+        jitoTipLamports: this.config.jitoTipLamports,
       });
     }
 
@@ -380,6 +386,8 @@ async function main() {
     privateKey: process.env.PRIVATE_KEY!,
     defaultSlippageBps: parseInt(process.env.DEFAULT_SLIPPAGE_BPS || '10000'),
     defaultPriorityFeeLamports: parseInt(process.env.DEFAULT_PRIORITY_FEE_LAMPORTS || '150000'),
+    broadcastFeeType: process.env.BROADCAST_FEE_TYPE as 'maxCap' | 'exactFee' | undefined,
+    jitoTipLamports: process.env.JITO_TIP_LAMPORTS ? parseInt(process.env.JITO_TIP_LAMPORTS) : undefined,
   });
 
   // Handle graceful shutdown

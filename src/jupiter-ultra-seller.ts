@@ -16,6 +16,8 @@ export interface JupiterSellerConfig {
   jupiterApiKey: string;
   defaultSlippageBps?: number;
   defaultPriorityFeeLamports?: number;
+  broadcastFeeType?: 'maxCap' | 'exactFee';
+  jitoTipLamports?: number;
   commitment?: Commitment;
 }
 
@@ -39,7 +41,10 @@ type PreparedSellContext = {
 export class JupiterUltraSeller {
   private readonly config: Required<
     Pick<JupiterSellerConfig, "defaultSlippageBps" | "defaultPriorityFeeLamports" | "commitment">
-  >;
+  > & {
+    broadcastFeeType?: 'maxCap' | 'exactFee';
+    jitoTipLamports?: number;
+  };
 
   private connection: Connection;
   private owner: Keypair;
@@ -52,6 +57,8 @@ export class JupiterUltraSeller {
       defaultSlippageBps: config.defaultSlippageBps ?? 10000,
       defaultPriorityFeeLamports: config.defaultPriorityFeeLamports ?? 150000,
       commitment: config.commitment ?? "processed",
+      broadcastFeeType: config.broadcastFeeType,
+      jitoTipLamports: config.jitoTipLamports,
     };
 
     this.connection = new Connection(config.rpcUrl, this.config.commitment);
@@ -105,6 +112,8 @@ export class JupiterUltraSeller {
     sellPercent?: number;
     slippageBps?: number;
     priorityFeeLamports?: number;
+    broadcastFeeType?: 'maxCap' | 'exactFee';
+    jitoTipLamports?: number;
   }): Promise<SellResult> {
     const ctx = this.prepared.get(params.prepKey);
     if (!ctx) {
@@ -115,6 +124,8 @@ export class JupiterUltraSeller {
     const slippageBps = params.slippageBps ?? this.config.defaultSlippageBps;
     const priorityFeeLamports =
       params.priorityFeeLamports ?? this.config.defaultPriorityFeeLamports;
+    const broadcastFeeType = params.broadcastFeeType ?? this.config.broadcastFeeType;
+    const jitoTipLamports = params.jitoTipLamports ?? this.config.jitoTipLamports;
 
     try {
       // Use cached balance from helius-client, fallback to RPC
@@ -151,6 +162,14 @@ export class JupiterUltraSeller {
 
       if (typeof priorityFeeLamports === "number") {
         qs.set("priorityFeeLamports", String(priorityFeeLamports));
+      }
+
+      if (broadcastFeeType) {
+        qs.set("broadcastFeeType", broadcastFeeType);
+      }
+
+      if (typeof jitoTipLamports === "number") {
+        qs.set("jitoTipLamports", String(jitoTipLamports));
       }
 
       const orderUrl = `${ULTRA_BASE}/order?${qs.toString()}`;
@@ -292,6 +311,8 @@ export class JupiterUltraSeller {
     sellPercent?: number;
     slippageBps?: number;
     priorityFeeLamports?: number;
+    broadcastFeeType?: 'maxCap' | 'exactFee';
+    jitoTipLamports?: number;
   }): Promise<SellResult> {
     const prepKey = `${params.inputMint}:${params.tokenAccount}`;
 
@@ -316,6 +337,8 @@ export class JupiterUltraSeller {
       sellPercent: params.sellPercent,
       slippageBps: params.slippageBps,
       priorityFeeLamports: params.priorityFeeLamports,
+      broadcastFeeType: params.broadcastFeeType,
+      jitoTipLamports: params.jitoTipLamports,
     });
   }
 
