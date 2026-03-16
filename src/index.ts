@@ -1,20 +1,24 @@
 import 'dotenv/config';
 import { HeliusWsClient } from './helius-client.js';
 import { PositionTracker } from './position-tracker.js';
-import { JupiterUltraSeller } from './jupiter-ultra-seller.js';
+import { ClmmSeller } from './clmm-seller.js';
 import { TokenPosition } from './types.js';
 
 interface BotConfig {
   heliusWsUrl: string;
   rpcUrl: string;
   heliusApiKey: string;
-  jupiterApiKey: string;
   walletAddress: string;
   privateKey: string;
   defaultSlippageBps?: number;
-  defaultPriorityFeeLamports?: number;
-  broadcastFeeType?: 'maxCap' | 'exactFee';
-  jitoTipLamports?: number;
+  priorityFeeMicroLamports?: number;
+  computeUnits?: number;
+  tipLamports?: number;
+  confirmAfterSend?: boolean;
+  blockhashRefreshMs?: number;
+  tokenBalancePollFallbackMs?: number;
+  staleBlockhashMs?: number;
+  staleTokenBalanceMs?: number;
 }
 
 /**
@@ -25,7 +29,7 @@ interface BotConfig {
 class RugDefenseBot {
   private heliusClient: HeliusWsClient;
   private positionTracker: PositionTracker;
-  private seller: JupiterUltraSeller;
+  private seller: ClmmSeller;
   private config: BotConfig;
   private isRunning = false;
   private pendingSells: Map<string, Promise<void>> = new Map();
@@ -40,7 +44,9 @@ class RugDefenseBot {
     this.heliusClient = new HeliusWsClient({
       wsUrl: config.heliusWsUrl,
       rpcUrl: config.rpcUrl,
+      walletAddress: config.walletAddress,
       onLiquidityRemoval: this.handleLiquidityRemoval.bind(this),
+      onNewToken: this.handleNewToken.bind(this),
       onError: this.handleError.bind(this),
       onConnect: this.handleConnect.bind(this),
     });
@@ -50,12 +56,19 @@ class RugDefenseBot {
       walletAddress: config.walletAddress,
     });
 
-    this.seller = new JupiterUltraSeller({
+    this.seller = new ClmmSeller({
       rpcUrl: config.rpcUrl,
-      jupiterApiKey: config.jupiterApiKey,
+      heliusApiKey: config.heliusApiKey,
       privateKey: config.privateKey,
       defaultSlippageBps: config.defaultSlippageBps,
-      defaultPriorityFeeLamports: config.defaultPriorityFeeLamports,
+      priorityFeeMicroLamports: config.priorityFeeMicroLamports,
+      computeUnits: config.computeUnits,
+      tipLamports: config.tipLamports,
+      confirmAfterSend: config.confirmAfterSend,
+      blockhashRefreshMs: config.blockhashRefreshMs,
+      tokenBalancePollFallbackMs: config.tokenBalancePollFallbackMs,
+      staleBlockhashMs: config.staleBlockhashMs,
+      staleTokenBalanceMs: config.staleTokenBalanceMs,
     });
   }
 
@@ -74,6 +87,9 @@ class RugDefenseBot {
     // Initialize seller
     console.log('[Bot] Initializing seller...');
     await this.seller.initialize();
+    
+    // Start blockhash refresh loop for fast sells
+    await this.seller.startBlockhashLoop();
 
     // Load existing positions from wallet
     console.log('[Bot] Loading existing positions...');
@@ -92,16 +108,58 @@ class RugDefenseBot {
     // Connect to Helius WebSocket
     await this.heliusClient.connect();
 
+    // Subscribe to wallet logs for immediate new token detection
+    this.heliusClient.subscribeToWalletLogs(this.config.walletAddress);
+
     // For each position, get dev's token account and subscribe
     for (const position of positions) {
       await this.subscribeToDevTokenAccount(position);
     }
 
-    // Start polling for new token buys
+    // Start polling for new token buys (backup)
     this.startPollingForNewBuys();
 
     this.isRunning = true;
     console.log('[Bot] 🛡️ Rug Defense Bot is now active!');
+  }
+
+  /**
+   * Handle new token detected from wallet logs (immediate detection)
+   */
+  private async handleNewToken(tokenMint: string, signature: string): Promise<void> {
+    // Skip if already known or checked
+    if (this.knownTokens.has(tokenMint) || this.checkedTokens.has(tokenMint)) {
+      return;
+    }
+
+    console.log(`[Bot] 🆕 New token detected via WS: ${tokenMint.slice(0, 8)}... (sig: ${signature.slice(0, 8)}...)`);
+    
+    // Mark as checked to prevent re-processing
+    this.checkedTokens.add(tokenMint);
+    this.knownTokens.add(tokenMint);
+
+    // Get user's token account for this mint
+    const userTokenAccount = await this.heliusClient.getUserTokenAccount(
+      this.config.walletAddress,
+      tokenMint
+    );
+
+    if (!userTokenAccount) {
+      console.warn(`[Bot] No token account found for ${tokenMint.slice(0, 8)}...`);
+      return;
+    }
+
+    // Get balance
+    const balance = await this.heliusClient.getTokenAccountBalance(userTokenAccount);
+    const amount = BigInt(balance?.value?.amount || '0');
+
+    if (amount <= 0n) {
+      console.warn(`[Bot] Zero balance for ${tokenMint.slice(0, 8)}...`);
+      return;
+    }
+
+    // Start monitoring this new position
+    await this.handleNewBuy(tokenMint, amount, userTokenAccount);
   }
 
   /**
@@ -225,10 +283,11 @@ class RugDefenseBot {
       }
       
       // Prepare emergency sell context for fast trigger
-      if (position.walletTokenAccount) {
+      if (position.walletTokenAccount && position.poolAddress) {
         try {
           const prepKey = await this.seller.prepareEmergencySell({
             inputMint: position.tokenMint,
+            poolId: position.poolAddress,
             tokenAccount: position.walletTokenAccount,
           });
           position.prepKey = prepKey;
@@ -277,41 +336,40 @@ class RugDefenseBot {
    * Execute emergency sell for a position
    */
   private async executeEmergencySell(position: TokenPosition): Promise<void> {
-    // Need wallet token account for sell
+    // Need wallet token account and pool address for sell
     if (!position.walletTokenAccount) {
       console.error(`[Bot] ❌ No wallet token account`);
       this.positionTracker.markLiquidityRemoved(position.tokenMint);
       return;
     }
 
-    // Get cached balance from helius-client
-    const cachedBalance = position.walletTokenAccount
-      ? this.heliusClient.getCachedBalance(position.walletTokenAccount)
-      : undefined;
+    if (!position.poolAddress) {
+      console.error(`[Bot] ❌ No pool address`);
+      this.positionTracker.markLiquidityRemoved(position.tokenMint);
+      return;
+    }
 
     // Use prepared context if available for fast trigger
     let result;
     if (position.prepKey) {
       result = await this.seller.emergencySellPrepared({
         prepKey: position.prepKey,
-        cachedBalance,
         sellPercent: 100,
         slippageBps: this.config.defaultSlippageBps,
-        priorityFeeLamports: this.config.defaultPriorityFeeLamports,
-        broadcastFeeType: this.config.broadcastFeeType,
-        jitoTipLamports: this.config.jitoTipLamports,
+        forceMinOutZero: true,
       });
     } else {
       // Fallback to legacy method (will auto-prepare)
       result = await this.seller.emergencySell({
         inputMint: position.tokenMint,
+        poolId: position.poolAddress,
         tokenAccount: position.walletTokenAccount,
-        cachedBalance,
         sellPercent: 100,
         slippageBps: this.config.defaultSlippageBps,
-        priorityFeeLamports: this.config.defaultPriorityFeeLamports,
-        broadcastFeeType: this.config.broadcastFeeType,
-        jitoTipLamports: this.config.jitoTipLamports,
+        priorityFeeMicroLamports: this.config.priorityFeeMicroLamports,
+        computeUnits: this.config.computeUnits,
+        tipLamports: this.config.tipLamports,
+        forceMinOutZero: true,
       });
     }
 
@@ -356,6 +414,7 @@ class RugDefenseBot {
       clearInterval(this.pollInterval);
       this.pollInterval = null;
     }
+    this.seller.shutdown();
     this.heliusClient.disconnect();
     this.isRunning = false;
   }
@@ -381,13 +440,17 @@ async function main() {
     heliusWsUrl: process.env.HELIUS_WS_URL!,
     rpcUrl: process.env.MAINNET_ENDPOINT!,
     heliusApiKey: process.env.HELIUS_API_KEY!,
-    jupiterApiKey: process.env.JUPITER_API_KEY!,
     walletAddress,
     privateKey: process.env.PRIVATE_KEY!,
     defaultSlippageBps: parseInt(process.env.DEFAULT_SLIPPAGE_BPS || '10000'),
-    defaultPriorityFeeLamports: parseInt(process.env.DEFAULT_PRIORITY_FEE_LAMPORTS || '150000'),
-    broadcastFeeType: process.env.BROADCAST_FEE_TYPE as 'maxCap' | 'exactFee' | undefined,
-    jitoTipLamports: process.env.JITO_TIP_LAMPORTS ? parseInt(process.env.JITO_TIP_LAMPORTS) : undefined,
+    priorityFeeMicroLamports: parseInt(process.env.PRIORITY_FEE_MICRO_LAMPORTS || '500000'),
+    computeUnits: parseInt(process.env.COMPUTE_UNITS || '1000000'),
+    tipLamports: parseInt(process.env.TIP_LAMPORTS || '200000'),
+    confirmAfterSend: process.env.CONFIRM_AFTER_SEND === 'true',
+    blockhashRefreshMs: parseInt(process.env.BLOCKHASH_REFRESH_MS || '1500'),
+    tokenBalancePollFallbackMs: parseInt(process.env.TOKEN_BALANCE_POLL_FALLBACK_MS || '10000'),
+    staleBlockhashMs: parseInt(process.env.STALE_BLOCKHASH_MS || '10000'),
+    staleTokenBalanceMs: parseInt(process.env.STALE_TOKEN_BALANCE_MS || '20000'),
   });
 
   // Handle graceful shutdown

@@ -9,6 +9,8 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  VersionedTransaction,
+  SendOptions,
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -22,7 +24,29 @@ import {
   PoolUtils,
 } from "@raydium-io/raydium-sdk-v2";
 
-// Helius tip wallets
+/**
+ * Rebuilt CLMM seller for Raydium SDK v2 + Helius Sender
+ *
+ * Goals:
+ * - fast emergency CLMM sell
+ * - avoid stale-quote / stale-pool issues
+ * - handle SDK builders that may return transaction OR transactions
+ * - keep token balance hot via websocket + polling fallback
+ * - use Helius Sender-compatible fee/tip path
+ *
+ * Notes:
+ * - This file is written to be robust across minor SDK return-shape differences,
+ *   so there are a few `any` casts around builder outputs.
+ * - It assumes a token -> WSOL/SOL sell on a Raydium CLMM pool.
+ */
+
+const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
+const MIN_JITO_TIP_LAMPORTS = 200_000;
+
+/**
+ * Helius tip wallets
+ * Keep current if Helius changes their list.
+ */
 const HELIUS_TIP_WALLETS = [
   "wyvPkWjVZz1M8fHQnMMCDTQDbkManefNNhweYk5WkcF",
   "2nyhqdwKcJZR2vcqCyrYsaPVdAnFoJjiksCXJ7hfEYgD",
@@ -35,10 +59,7 @@ const HELIUS_TIP_WALLETS = [
   "4vieeGHPYPG2MmyPRcYjdiDmmhN3ww7hsFNap8pVN3Ey",
   "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
   "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
-];
-
-const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
-const MIN_TIP_LAMPORTS = 200_000;
+] as const;
 
 type HeliusSenderResp = {
   jsonrpc: string;
@@ -56,24 +77,45 @@ export interface ClmmSellerConfig {
   heliusApiKey: string;
   privateKey: string;
 
+  commitment?: Commitment;
+
   // execution
   defaultSlippageBps?: number;
   priorityFeeMicroLamports?: number;
   computeUnits?: number;
-  confirmAfterSend?: boolean;
   tipLamports?: number;
+  confirmAfterSend?: boolean;
 
-  // refresh loops
-  commitment?: Commitment;
+  // cache / loops
   blockhashRefreshMs?: number;
   tokenBalancePollFallbackMs?: number;
+  staleBlockhashMs?: number;
+  staleTokenBalanceMs?: number;
+}
+
+export interface PrepareParams {
+  inputMint: string;
+  poolId: string;
+  tokenAccount?: string;
+
+  priorityFeeMicroLamports?: number;
+  computeUnits?: number;
+  tipLamports?: number;
+}
+
+export interface EmergencySellParams {
+  prepKey: string;
+  sellPercent?: number;
+  slippageBps?: number;
+  forceMinOutZero?: boolean;
+  confirmAfterSend?: boolean;
 }
 
 export interface SellResult {
   success: boolean;
   txSignature?: string;
   amountIn?: string;
-  amountOut?: string;
+  minAmountOut?: string;
   error?: string;
 }
 
@@ -83,12 +125,7 @@ type CachedBlockhash = {
   updatedAt: number;
 };
 
-type FixedIxs = {
-  computeBudgetIxs: ReturnType<typeof ComputeBudgetProgram.setComputeUnitLimit>[];
-  tipIx: ReturnType<typeof SystemProgram.transfer>;
-};
-
-type PreparedClmmSellContext = {
+type PreparedSellContext = {
   key: string;
   poolId: string;
   inputMint: PublicKey;
@@ -96,58 +133,56 @@ type PreparedClmmSellContext = {
   tokenProgramId: PublicKey;
   wsolMint: PublicKey;
 
-  // live token balance cache
   tokenAmountRaw: bigint;
   tokenBalanceUpdatedAt: number;
   tokenAccountSubId: number | null;
   tokenBalancePollTimer: NodeJS.Timeout | null;
 
-  // static pool snapshot (fetched once at prepare time)
-  poolInfo: any;
-  poolKeys: any;
-  computePoolInfo: any;
-  tickData: any;
-  epochInfo: any;
-
-  // static/fixed ixs
-  fixedIxs: FixedIxs;
+  priorityFeeMicroLamports: number;
+  computeUnits: number;
+  tipLamports: number;
 };
 
 export class ClmmSeller {
   private readonly config: Required<
     Pick<
       ClmmSellerConfig,
+      | "commitment"
       | "defaultSlippageBps"
       | "priorityFeeMicroLamports"
       | "computeUnits"
-      | "confirmAfterSend"
       | "tipLamports"
-      | "commitment"
+      | "confirmAfterSend"
       | "blockhashRefreshMs"
       | "tokenBalancePollFallbackMs"
+      | "staleBlockhashMs"
+      | "staleTokenBalanceMs"
     >
   >;
 
-  private connection: Connection;
-  private owner: Keypair;
+  private readonly connection: Connection;
+  private readonly owner: Keypair;
+  private readonly heliusSenderUrl: string;
+
   private raydium: Awaited<ReturnType<typeof Raydium.load>> | null = null;
-  private heliusSenderUrl: string;
 
   private blockhashCache: CachedBlockhash | null = null;
   private blockhashTimer: NodeJS.Timeout | null = null;
 
-  private prepared = new Map<string, PreparedClmmSellContext>();
+  private prepared = new Map<string, PreparedSellContext>();
 
   constructor(config: ClmmSellerConfig) {
     this.config = {
+      commitment: config.commitment ?? "processed",
       defaultSlippageBps: config.defaultSlippageBps ?? 500,
       priorityFeeMicroLamports: config.priorityFeeMicroLamports ?? 500_000,
-      computeUnits: config.computeUnits ?? 600_000,
+      computeUnits: config.computeUnits ?? 1_000_000,
+      tipLamports: Math.max(config.tipLamports ?? MIN_JITO_TIP_LAMPORTS, MIN_JITO_TIP_LAMPORTS),
       confirmAfterSend: config.confirmAfterSend ?? false,
-      tipLamports: config.tipLamports ?? MIN_TIP_LAMPORTS,
-      commitment: config.commitment ?? "processed",
       blockhashRefreshMs: config.blockhashRefreshMs ?? 1_500,
       tokenBalancePollFallbackMs: config.tokenBalancePollFallbackMs ?? 10_000,
+      staleBlockhashMs: config.staleBlockhashMs ?? 10_000,
+      staleTokenBalanceMs: config.staleTokenBalanceMs ?? 20_000,
     };
 
     this.connection = new Connection(config.rpcUrl, this.config.commitment);
@@ -164,20 +199,18 @@ export class ClmmSeller {
   async initialize(): Promise<void> {
     if (this.raydium) return;
 
-    console.log("[ClmmSeller] Initializing Raydium SDK...");
+    const owner = this.owner.publicKey;
 
-    const ownerPubkey = this.owner.publicKey;
-
-    const solAccountResp = await this.connection.getAccountInfo(ownerPubkey);
-    const tokenAccountResp = await this.connection.getTokenAccountsByOwner(ownerPubkey, {
+    const solAccountResp = await this.connection.getAccountInfo(owner);
+    const tokenAccountResp = await this.connection.getTokenAccountsByOwner(owner, {
       programId: TOKEN_PROGRAM_ID,
     });
-    const token2022Resp = await this.connection.getTokenAccountsByOwner(ownerPubkey, {
+    const token2022Resp = await this.connection.getTokenAccountsByOwner(owner, {
       programId: TOKEN_2022_PROGRAM_ID,
     });
 
     const tokenAccountData = parseTokenAccountResp({
-      owner: ownerPubkey,
+      owner,
       solAccountResp,
       tokenAccountResp: {
         context: tokenAccountResp.context,
@@ -193,14 +226,18 @@ export class ClmmSeller {
       disableLoadToken: true,
     });
 
-    console.log("[ClmmSeller] Initialized");
-    console.log(`[ClmmSeller] Wallet: ${this.owner.publicKey.toBase58()}`);
+    console.log(`[ClmmSeller] Initialized for ${owner.toBase58()}`);
   }
 
-  /**
-   * Starts the global blockhash refresher loop.
-   * Call once during app startup.
-   */
+  async refreshWalletTokenAccounts(forceUpdate = true): Promise<void> {
+    if (!this.raydium) throw new Error("Raydium not initialized");
+    try {
+      await this.raydium.account.fetchWalletTokenAccounts({ forceUpdate });
+    } catch (error) {
+      console.warn("[ClmmSeller] Wallet token account refresh failed:", error);
+    }
+  }
+
   async startBlockhashLoop(): Promise<void> {
     const refresh = async () => {
       try {
@@ -219,29 +256,37 @@ export class ClmmSeller {
 
     if (this.blockhashTimer) clearInterval(this.blockhashTimer);
     this.blockhashTimer = setInterval(refresh, this.config.blockhashRefreshMs);
-    console.log(
-      `[ClmmSeller] Blockhash loop started (${this.config.blockhashRefreshMs}ms)` 
-    );
+
+    console.log(`[ClmmSeller] Blockhash loop started (${this.config.blockhashRefreshMs}ms)`);
   }
 
   private getCachedBlockhash(): CachedBlockhash {
     if (!this.blockhashCache) {
-      throw new Error("Blockhash cache is empty. Call startBlockhashLoop() first.");
+      throw new Error("Blockhash cache empty. Call startBlockhashLoop() first.");
     }
 
-    // very small guard, because we are refreshing aggressively
     const ageMs = Date.now() - this.blockhashCache.updatedAt;
-    if (ageMs > 10_000) {
-      throw new Error(`Cached blockhash is stale (${ageMs}ms old)`);
+    if (ageMs > this.config.staleBlockhashMs) {
+      throw new Error(`Cached blockhash stale (${ageMs}ms old)`);
     }
 
     return this.blockhashCache;
   }
 
-  /**
-   * Helius Sender /fast
-   */
-  private async sendViaHeliusSender(tx: Transaction): Promise<string> {
+  private async getLamportsBalance(): Promise<number> {
+    return this.connection.getBalance(this.owner.publicKey, this.config.commitment);
+  }
+
+  private randomTipWallet(): PublicKey {
+    const chosen =
+      HELIUS_TIP_WALLETS[Math.floor(Math.random() * HELIUS_TIP_WALLETS.length)];
+    return new PublicKey(chosen);
+  }
+
+  private async sendViaHeliusSender(
+    tx: Transaction | VersionedTransaction,
+    opts?: SendOptions
+  ): Promise<string> {
     const raw = tx.serialize();
     const base64Tx = Buffer.from(raw).toString("base64");
 
@@ -255,6 +300,7 @@ export class ClmmSeller {
           encoding: "base64",
           skipPreflight: true,
           maxRetries: 0,
+          ...opts,
         },
       ],
     };
@@ -266,28 +312,22 @@ export class ClmmSeller {
     });
 
     if (resp.status < 200 || resp.status >= 300) {
-      const body = typeof resp.data === "string" ? resp.data : JSON.stringify(resp.data);
-      throw new Error(`Helius Sender HTTP ${resp.status}: ${body}`);
+      throw new Error(`Helius Sender HTTP ${resp.status}: ${JSON.stringify(resp.data)}`);
     }
 
     if (resp.data.error) {
       throw new Error(
-        `Helius Sender error ${resp.data.error.code}: ${resp.data.error.message}` 
+        `Helius Sender error ${resp.data.error.code}: ${resp.data.error.message}`
       );
     }
 
     if (!resp.data.result) {
-      throw new Error(
-        `Helius Sender returned no signature: ${JSON.stringify(resp.data)}` 
-      );
+      throw new Error(`Helius Sender returned no signature: ${JSON.stringify(resp.data)}`);
     }
 
     return resp.data.result;
   }
 
-  /**
-   * Determine token account + token program if tokenAccount was not supplied.
-   */
   private async findTokenAccountWithBalance(
     mint: PublicKey
   ): Promise<{ pubkey: PublicKey; amountRaw: bigint; programId: PublicKey } | null> {
@@ -312,40 +352,6 @@ export class ClmmSeller {
     return null;
   }
 
-  private createFixedIxs(
-    priorityFeeMicroLamports: number,
-    computeUnits: number,
-    tipLamports: number
-  ): FixedIxs {
-    const tipWallet =
-      HELIUS_TIP_WALLETS[Math.floor(Math.random() * HELIUS_TIP_WALLETS.length)];
-
-    const computeBudgetIxs = [
-      ComputeBudgetProgram.setComputeUnitLimit({
-        units: computeUnits,
-      }),
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: priorityFeeMicroLamports,
-      }),
-    ];
-
-    const tipIx = SystemProgram.transfer({
-      fromPubkey: this.owner.publicKey,
-      toPubkey: new PublicKey(tipWallet),
-      lamports: tipLamports,
-    });
-
-    return {
-      computeBudgetIxs: computeBudgetIxs as ReturnType<
-        typeof ComputeBudgetProgram.setComputeUnitLimit
-      >[],
-      tipIx,
-    };
-  }
-
-  /**
-   * Parse token amount from websocket account data.
-   */
   private extractTokenAmountFromAccountData(
     accountPubkey: PublicKey,
     accountInfo: { data: Buffer },
@@ -359,11 +365,7 @@ export class ClmmSeller {
     }
   }
 
-  /**
-   * Subscribe to token account changes over websocket and keep in-memory amount fresh.
-   */
-  private async startTokenAccountMonitoring(ctx: PreparedClmmSellContext): Promise<void> {
-    // seed current balance first
+  private async startTokenAccountMonitoring(ctx: PreparedSellContext): Promise<void> {
     try {
       const bal = await this.connection.getTokenAccountBalance(
         ctx.tokenAccount,
@@ -371,11 +373,6 @@ export class ClmmSeller {
       );
       ctx.tokenAmountRaw = BigInt(bal.value.amount);
       ctx.tokenBalanceUpdatedAt = Date.now();
-      console.log(
-        `[ClmmSeller] Seed token balance: ${ctx.tokenAmountRaw.toString()} for ${ctx.tokenAccount
-          .toBase58()
-          .slice(0, 12)}...`
-      );
     } catch (error) {
       console.error("[ClmmSeller] Failed to seed token balance:", error);
     }
@@ -389,7 +386,6 @@ export class ClmmSeller {
             { data: info.data as Buffer },
             ctx.tokenProgramId
           );
-
           if (parsed !== null) {
             ctx.tokenAmountRaw = parsed;
             ctx.tokenBalanceUpdatedAt = Date.now();
@@ -397,17 +393,10 @@ export class ClmmSeller {
         },
         this.config.commitment
       );
-
-      console.log(
-        `[ClmmSeller] Token account WS monitor started for ${ctx.tokenAccount
-          .toBase58()
-          .slice(0, 12)}...`
-      );
     } catch (error) {
       console.error("[ClmmSeller] Failed to start token WS monitor:", error);
     }
 
-    // RPC fallback in case websocket lags or misses
     const poll = async () => {
       try {
         const bal = await this.connection.getTokenAccountBalance(
@@ -417,7 +406,7 @@ export class ClmmSeller {
         ctx.tokenAmountRaw = BigInt(bal.value.amount);
         ctx.tokenBalanceUpdatedAt = Date.now();
       } catch (error) {
-        console.error("[ClmmSeller] Token balance fallback poll failed:", error);
+        console.error("[ClmmSeller] Token balance poll failed:", error);
       }
     };
 
@@ -428,35 +417,125 @@ export class ClmmSeller {
     );
   }
 
-  /**
-   * Fetch pool snapshot once (called at prepare time)
-   */
-  private async fetchPoolSnapshot(
-    poolId: string
-  ): Promise<{ poolInfo: any; poolKeys: any; computePoolInfo: any; tickData: any; epochInfo: any }> {
+  private async fetchFreshPoolSnapshot(poolId: string) {
     if (!this.raydium) throw new Error("Raydium not initialized");
 
     const { poolInfo, poolKeys, computePoolInfo, tickData } =
       await this.raydium.clmm.getPoolInfoFromRpc(poolId);
-
     const epochInfo = await this.raydium.fetchEpochInfo();
 
     return { poolInfo, poolKeys, computePoolInfo, tickData, epochInfo };
   }
 
+  private addComputeAndTipToLegacyTransaction(
+    tx: Transaction,
+    priorityFeeMicroLamports: number,
+    computeUnits: number,
+    tipLamports: number
+  ): Transaction {
+    const tipIx = SystemProgram.transfer({
+      fromPubkey: this.owner.publicKey,
+      toPubkey: this.randomTipWallet(),
+      lamports: Math.max(tipLamports, MIN_JITO_TIP_LAMPORTS),
+    });
+
+    const finalTx = new Transaction();
+
+    finalTx.feePayer = tx.feePayer ?? this.owner.publicKey;
+    finalTx.recentBlockhash = tx.recentBlockhash;
+
+    finalTx.add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: priorityFeeMicroLamports,
+      })
+    );
+
+    for (const ix of tx.instructions) {
+      finalTx.add(ix);
+    }
+
+    finalTx.add(tipIx);
+
+    return finalTx;
+  }
+
   /**
-   * Prepare a sell context once, then keep it fresh continuously.
-   * Returns a prepKey to use with emergencySellPrepared().
+   * Normalize Raydium builder output into a list of txs.
+   * Raydium's demo states tx builders may return transaction OR transactions.
    */
-  async prepareEmergencySell(params: {
-    inputMint: string;
-    poolId: string;
-    tokenAccount?: string;
-    priorityFeeMicroLamports?: number;
-    computeUnits?: number;
-    tipLamports?: number;
-  }): Promise<string> {
+  private extractBuiltTransactions(built: any): Array<Transaction | VersionedTransaction> {
+    const out: Array<Transaction | VersionedTransaction> = [];
+
+    if (built?.transaction) {
+      if (Array.isArray(built.transaction)) {
+        for (const tx of built.transaction) {
+          if (tx) out.push(tx);
+        }
+      } else {
+        out.push(built.transaction);
+      }
+    }
+
+    if (Array.isArray(built?.transactions)) {
+      for (const tx of built.transactions) {
+        if (tx) out.push(tx);
+      }
+    }
+
+    // builder.allTxData fallback
+    const allTxData = built?.builder?.allTxData;
+    if (Array.isArray(allTxData)) {
+      for (const item of allTxData) {
+        const tx = item?.transaction ?? item?.tx ?? item;
+        if (tx && !out.includes(tx)) out.push(tx);
+      }
+    }
+
+    return out;
+  }
+
+  private signBuiltTransaction(
+    tx: Transaction | VersionedTransaction
+  ): Transaction | VersionedTransaction {
+    if (tx instanceof VersionedTransaction) {
+      tx.sign([this.owner]);
+      return tx;
+    }
+
+    tx.sign(this.owner);
+    return tx;
+  }
+
+  private withFreshBlockhash(
+    tx: Transaction | VersionedTransaction,
+    blockhash: string
+  ): Transaction | VersionedTransaction {
+    if (tx instanceof VersionedTransaction) {
+      tx.message.recentBlockhash = blockhash;
+      return tx;
+    }
+
+    tx.recentBlockhash = blockhash;
+    return tx;
+  }
+
+  private estimateRequiredFeeLamports(
+    computeUnits: number,
+    priorityFeeMicroLamports: number,
+    tipLamports: number,
+    signatures = 1
+  ): number {
+    const baseFee = 5_000 * signatures;
+    const priorityFeeLamports = Math.ceil(
+      (computeUnits * priorityFeeMicroLamports) / 1_000_000
+    );
+    return baseFee + priorityFeeLamports + tipLamports;
+  }
+
+  async prepareEmergencySell(params: PrepareParams): Promise<string> {
     await this.initialize();
+    await this.refreshWalletTokenAccounts(true);
 
     const inputMint = new PublicKey(params.inputMint);
     const poolId = params.poolId;
@@ -473,11 +552,8 @@ export class ClmmSeller {
         tokenAccount,
         this.config.commitment
       );
-      if (!accInfo) {
-        throw new Error("Provided token account not found");
-      }
+      if (!accInfo) throw new Error("Provided token account not found");
 
-      // Detect token program from owner field
       tokenProgramId = accInfo.owner.equals(TOKEN_2022_PROGRAM_ID)
         ? TOKEN_2022_PROGRAM_ID
         : TOKEN_PROGRAM_ID;
@@ -489,24 +565,15 @@ export class ClmmSeller {
       seedBalance = BigInt(bal.value.amount);
     } else {
       const found = await this.findTokenAccountWithBalance(inputMint);
-      if (!found) {
-        throw new Error("No token account with balance found for this mint");
-      }
+      if (!found) throw new Error("No token account with balance found for this mint");
+
       tokenAccount = found.pubkey;
       tokenProgramId = found.programId;
       seedBalance = found.amountRaw;
     }
 
-    const fixedIxs = this.createFixedIxs(
-      params.priorityFeeMicroLamports ?? this.config.priorityFeeMicroLamports,
-      params.computeUnits ?? this.config.computeUnits,
-      params.tipLamports ?? this.config.tipLamports
-    );
-
-    const key = `${poolId}:${inputMint.toBase58()}:${tokenAccount.toBase58()}`;
-
-    const ctx: PreparedClmmSellContext = {
-      key,
+    const ctx: PreparedSellContext = {
+      key: `${poolId}:${inputMint.toBase58()}:${tokenAccount.toBase58()}`,
       poolId,
       inputMint,
       tokenAccount,
@@ -518,68 +585,43 @@ export class ClmmSeller {
       tokenAccountSubId: null,
       tokenBalancePollTimer: null,
 
-      poolInfo: null,
-      poolKeys: null,
-      computePoolInfo: null,
-      tickData: null,
-      epochInfo: null,
-
-      fixedIxs,
+      priorityFeeMicroLamports:
+        params.priorityFeeMicroLamports ?? this.config.priorityFeeMicroLamports,
+      computeUnits: params.computeUnits ?? this.config.computeUnits,
+      tipLamports: Math.max(
+        params.tipLamports ?? this.config.tipLamports,
+        MIN_JITO_TIP_LAMPORTS
+      ),
     };
 
-    // fetch pool snapshot once at prepare time
-    const snapshot = await this.fetchPoolSnapshot(poolId);
-    ctx.poolInfo = snapshot.poolInfo;
-    ctx.poolKeys = snapshot.poolKeys;
-    ctx.computePoolInfo = snapshot.computePoolInfo;
-    ctx.tickData = snapshot.tickData;
-    ctx.epochInfo = snapshot.epochInfo;
+    // Quick validation with fresh pool fetch at prepare time
+    const snapshot = await this.fetchFreshPoolSnapshot(poolId);
 
-    // sanity checks
-    const mintA = ctx.poolInfo.mintA.address;
-    const mintB = ctx.poolInfo.mintB.address;
+    const mintA = snapshot.poolInfo.mintA.address;
+    const mintB = snapshot.poolInfo.mintB.address;
 
     if (ctx.inputMint.toBase58() !== mintA && ctx.inputMint.toBase58() !== mintB) {
       throw new Error(
-        `Input mint ${ctx.inputMint.toBase58()} is not in pool mints (${mintA}, ${mintB})` 
+        `Input mint ${ctx.inputMint.toBase58()} is not in pool mints (${mintA}, ${mintB})`
       );
     }
 
     if (mintA !== DEFAULT_WSOL_MINT && mintB !== DEFAULT_WSOL_MINT) {
-      throw new Error("Pool does not contain WSOL - only token -> SOL supported");
+      throw new Error("Pool does not contain WSOL; this seller supports token -> SOL only");
     }
 
-    this.prepared.set(key, ctx);
-
+    this.prepared.set(ctx.key, ctx);
     await this.startTokenAccountMonitoring(ctx);
 
-    console.log(`[ClmmSeller] Prepared context: ${key}`);
-    console.log(`[ClmmSeller] Pool: ${poolId.slice(0, 12)}...`);
-    console.log(`[ClmmSeller] Token account: ${tokenAccount.toBase58().slice(0, 12)}...`);
-    console.log(`[ClmmSeller] Seed balance: ${seedBalance.toString()}`);
+    console.log(`[ClmmSeller] Prepared ${ctx.key}`);
+    console.log(`[ClmmSeller] Seed balance ${seedBalance.toString()}`);
 
-    return key;
+    return ctx.key;
   }
 
-  /**
-   * Fast trigger path.
-   * Uses:
-   * - cached token balance from websocket
-   * - cached pool snapshot
-   * - cached recent blockhash
-   * - local Raydium swap build
-   */
-  async emergencySellPrepared(params: {
-    prepKey: string;
-    sellPercent?: number;
-    slippageBps?: number;
-    forceMinOutZero?: boolean;
-    confirmAfterSend?: boolean;
-  }): Promise<SellResult> {
+  async emergencySellPrepared(params: EmergencySellParams): Promise<SellResult> {
     try {
-      if (!this.raydium) {
-        await this.initialize();
-      }
+      await this.initialize();
 
       const ctx = this.prepared.get(params.prepKey);
       if (!ctx) {
@@ -592,94 +634,131 @@ export class ClmmSeller {
       const confirmAfterSend =
         params.confirmAfterSend ?? this.config.confirmAfterSend;
 
-      // optional freshness guard for token balance only
-      const balanceAgeMs = Date.now() - ctx.tokenBalanceUpdatedAt;
-
-      if (balanceAgeMs > Math.max(this.config.tokenBalancePollFallbackMs * 3, 8_000)) {
+      const tokenAgeMs = Date.now() - ctx.tokenBalanceUpdatedAt;
+      if (tokenAgeMs > this.config.staleTokenBalanceMs) {
         return {
           success: false,
-          error: `Token balance cache is stale (${balanceAgeMs}ms old)`,
+          error: `Token balance cache stale (${tokenAgeMs}ms old)`,
         };
       }
 
-      const amountRaw = ctx.tokenAmountRaw;
-      if (amountRaw <= 0n) {
+      const totalRaw = ctx.tokenAmountRaw;
+      if (totalRaw <= 0n) {
         return { success: false, error: "No balance to sell" };
       }
 
       const amountInRaw =
-        (amountRaw * BigInt(Math.floor(sellPercent * 100))) / 10000n;
+        (totalRaw * BigInt(Math.floor(sellPercent * 100))) / 10000n;
 
       if (amountInRaw <= 0n) {
         return { success: false, error: "Calculated sell amount is 0" };
       }
 
-      const mintA = ctx.poolInfo.mintA.address;
-      const mintB = ctx.poolInfo.mintB.address;
-      const baseIn = ctx.inputMint.toBase58() === mintA;
-      const tokenOut = baseIn ? ctx.poolInfo.mintB : ctx.poolInfo.mintA;
+      const feeBudget = this.estimateRequiredFeeLamports(
+        ctx.computeUnits,
+        ctx.priorityFeeMicroLamports,
+        ctx.tipLamports
+      );
+      const lamportsBalance = await this.getLamportsBalance();
+      if (lamportsBalance < feeBudget) {
+        return {
+          success: false,
+          error: `Insufficient SOL for fees. Need ~${feeBudget} lamports, have ${lamportsBalance}`,
+        };
+      }
 
-      // compute quote from cached pool snapshot
+      // refresh Raydium's internal wallet account cache before build
+      await this.refreshWalletTokenAccounts(true);
+
+      // refresh CLMM state right before sell
+      const { poolInfo, poolKeys, computePoolInfo, tickData, epochInfo } =
+        await this.fetchFreshPoolSnapshot(ctx.poolId);
+
+      const mintA = poolInfo.mintA.address;
+      const mintB = poolInfo.mintB.address;
+      const tokenOut = ctx.inputMint.toBase58() === mintA ? poolInfo.mintB : poolInfo.mintA;
+
       const quote = PoolUtils.computeAmountOutFormat({
-        poolInfo: ctx.computePoolInfo,
-        tickArrayCache: ctx.tickData[ctx.poolId],
+        poolInfo: computePoolInfo,
+        tickArrayCache: tickData[ctx.poolId],
         amountIn: new BN(amountInRaw.toString()),
         tokenOut,
         slippage,
-        epochInfo: ctx.epochInfo,
+        epochInfo,
       });
 
       const amountOutMin = params.forceMinOutZero
         ? new BN(0)
         : quote.minAmountOut.amount.raw;
 
-      // build swap locally using cached pool context
       const built = await this.raydium!.clmm.swap({
-        poolInfo: ctx.poolInfo,
-        poolKeys: ctx.poolKeys,
+        poolInfo,
+        poolKeys,
         inputMint: ctx.inputMint,
         amountIn: new BN(amountInRaw.toString()),
         amountOutMin,
-        observationId: ctx.computePoolInfo.observationId,
+        observationId: computePoolInfo.observationId,
         ownerInfo: {
-          useSOLBalance: true,
           feePayer: this.owner.publicKey,
+          // false is safer for token -> SOL flow unless you intentionally
+          // want SOL balance semantics for input side.
+          useSOLBalance: false,
         },
         remainingAccounts: quote.remainingAccounts,
         txVersion: TxVersion.LEGACY,
-        computeBudgetConfig: undefined, // fixed compute budget already prebuilt
+        computeBudgetConfig: undefined,
         feePayer: this.owner.publicKey,
       });
 
-      const swapTx = built.transaction as Transaction;
+      const builtTxs = this.extractBuiltTransactions(built);
+
+      if (!builtTxs.length) {
+        return { success: false, error: "Raydium swap returned no built transaction" };
+      }
+
+      // For emergency sell, we send the last built tx because earlier ones are
+      // usually setup steps. If multiple txs are returned, you may need to send
+      // all of them sequentially for your exact SDK version / token path.
+      const rawBuiltTx = builtTxs[builtTxs.length - 1];
+
+      if (!(rawBuiltTx instanceof Transaction) && !(rawBuiltTx instanceof VersionedTransaction)) {
+        return { success: false, error: "Unsupported built transaction type" };
+      }
+
+      if (rawBuiltTx instanceof VersionedTransaction) {
+        return {
+          success: false,
+          error:
+            "Raydium returned a versioned transaction. This seller expects legacy tx output. Force LEGACY or adapt the tip/compute injection path.",
+        };
+      }
+
       const { blockhash, lastValidBlockHeight } = this.getCachedBlockhash();
 
-      // final fast tx assembly
-      const finalTx = new Transaction();
+      // Replace blockhash, then prepend compute budget + append tip
+      rawBuiltTx.feePayer = this.owner.publicKey;
+      rawBuiltTx.recentBlockhash = blockhash;
+
+      const finalTx = this.addComputeAndTipToLegacyTransaction(
+        rawBuiltTx,
+        ctx.priorityFeeMicroLamports,
+        ctx.computeUnits,
+        ctx.tipLamports
+      );
+
       finalTx.feePayer = this.owner.publicKey;
       finalTx.recentBlockhash = blockhash;
 
-      // compute budget first
-      for (const ix of ctx.fixedIxs.computeBudgetIxs) {
-        finalTx.add(ix);
-      }
-
-      // Raydium swap instructions
-      for (const ix of swapTx.instructions) {
-        finalTx.add(ix);
-      }
-
-      // Helius tip last
-      finalTx.add(ctx.fixedIxs.tipIx);
-
-      finalTx.sign(this.owner);
+      this.signBuiltTransaction(finalTx);
 
       console.log(
-        `[ClmmSeller] Fast sell trigger -> amount=${amountInRaw.toString()} balanceAge=${balanceAgeMs}ms` 
+        `[ClmmSeller] Emergency sell -> amount=${amountInRaw.toString()} minOut=${amountOutMin.toString()}`
       );
 
-      const sig = await this.sendViaHeliusSender(finalTx);
-      console.log(`[ClmmSeller] Sent: ${sig}`);
+      const sig = await this.sendViaHeliusSender(finalTx, {
+        skipPreflight: true,
+        maxRetries: 0,
+      });
 
       if (confirmAfterSend) {
         await this.connection.confirmTransaction(
@@ -690,26 +769,21 @@ export class ClmmSeller {
           },
           "processed"
         );
-        console.log(`[ClmmSeller] Confirmed: ${sig}`);
       }
 
       return {
         success: true,
         txSignature: sig,
         amountIn: amountInRaw.toString(),
-        amountOut: amountOutMin.toString(),
+        minAmountOut: amountOutMin.toString(),
       };
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[ClmmSeller] Sell failed: ${errorMsg}`);
-      return { success: false, error: errorMsg };
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error("[ClmmSeller] Sell failed:", msg);
+      return { success: false, error: msg };
     }
   }
 
-  /**
-   * Legacy compatibility wrapper.
-   * If you still call emergencySell(), this now auto-prepares once and then uses the fast path.
-   */
   async emergencySell(params: {
     inputMint: string;
     poolId: string;
@@ -718,43 +792,59 @@ export class ClmmSeller {
     slippageBps?: number;
     priorityFeeMicroLamports?: number;
     computeUnits?: number;
+    tipLamports?: number;
     forceMinOutZero?: boolean;
+    confirmAfterSend?: boolean;
   }): Promise<SellResult> {
-    const prepKey = `${params.poolId}:${params.inputMint}:${params.tokenAccount ?? "auto"}`;
+    let prepKey: string | undefined;
 
-    // Reuse existing prepared context if exact key already exists,
-    // otherwise prepare a fresh one.
-    let matchedKey: string | undefined;
     for (const key of this.prepared.keys()) {
       if (key.startsWith(`${params.poolId}:${params.inputMint}:`)) {
         if (!params.tokenAccount || key.endsWith(`:${params.tokenAccount}`)) {
-          matchedKey = key;
+          prepKey = key;
           break;
         }
       }
     }
 
-    if (!matchedKey) {
-      matchedKey = await this.prepareEmergencySell({
+    if (!prepKey) {
+      prepKey = await this.prepareEmergencySell({
         inputMint: params.inputMint,
         poolId: params.poolId,
         tokenAccount: params.tokenAccount,
         priorityFeeMicroLamports: params.priorityFeeMicroLamports,
         computeUnits: params.computeUnits,
+        tipLamports: params.tipLamports,
       });
     }
 
     return this.emergencySellPrepared({
-      prepKey: matchedKey ?? prepKey,
+      prepKey,
       sellPercent: params.sellPercent,
       slippageBps: params.slippageBps,
       forceMinOutZero: params.forceMinOutZero,
+      confirmAfterSend: params.confirmAfterSend,
     });
   }
 
-  /**
-   * Stop one prepared context.
-   */
+  getPreparedState(prepKey: string) {
+    const ctx = this.prepared.get(prepKey);
+    if (!ctx) return null;
+
+    return {
+      prepKey: ctx.key,
+      poolId: ctx.poolId,
+      inputMint: ctx.inputMint.toBase58(),
+      tokenAccount: ctx.tokenAccount.toBase58(),
+      tokenAmountRaw: ctx.tokenAmountRaw.toString(),
+      tokenBalanceUpdatedAt: ctx.tokenBalanceUpdatedAt,
+      blockhashUpdatedAt: this.blockhashCache?.updatedAt ?? null,
+      priorityFeeMicroLamports: ctx.priorityFeeMicroLamports,
+      computeUnits: ctx.computeUnits,
+      tipLamports: ctx.tipLamports,
+    };
+  }
+
   async stopPrepared(prepKey: string): Promise<void> {
     const ctx = this.prepared.get(prepKey);
     if (!ctx) return;
@@ -774,41 +864,18 @@ export class ClmmSeller {
     }
 
     this.prepared.delete(prepKey);
-    console.log(`[ClmmSeller] Stopped prepared context: ${prepKey}`);
   }
 
-  /**
-   * Stop all loops/listeners.
-   */
   async shutdown(): Promise<void> {
     if (this.blockhashTimer) {
       clearInterval(this.blockhashTimer);
       this.blockhashTimer = null;
     }
 
-    const keys = [...this.prepared.keys()];
-    for (const key of keys) {
+    for (const key of [...this.prepared.keys()]) {
       await this.stopPrepared(key);
     }
 
     console.log("[ClmmSeller] Shutdown complete");
-  }
-
-  /**
-   * Helpful inspection method.
-   */
-  getPreparedState(prepKey: string) {
-    const ctx = this.prepared.get(prepKey);
-    if (!ctx) return null;
-
-    return {
-      prepKey: ctx.key,
-      poolId: ctx.poolId,
-      inputMint: ctx.inputMint.toBase58(),
-      tokenAccount: ctx.tokenAccount.toBase58(),
-      tokenAmountRaw: ctx.tokenAmountRaw.toString(),
-      tokenBalanceUpdatedAt: ctx.tokenBalanceUpdatedAt,
-      blockhashUpdatedAt: this.blockhashCache?.updatedAt ?? null,
-    };
   }
 }

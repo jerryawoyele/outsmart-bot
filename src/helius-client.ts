@@ -31,7 +31,9 @@ async function retryWithBackoff<T>(
 export interface HeliusWsConfig {
   wsUrl: string;
   rpcUrl: string;
+  walletAddress?: string; // For wallet logs subscription
   onLiquidityRemoval?: (tokenMint: string, signature: string) => void;
+  onNewToken?: (tokenMint: string, signature: string) => void;
   onError?: (error: Error) => void;
   onConnect?: () => void;
 }
@@ -97,6 +99,9 @@ export class HeliusWsClient {
   private pendingBalanceSubs: Map<number, string> = new Map(); // requestId -> tokenAccount (placeholder)
   private tokenAccountToBalanceSubId: Map<string, number> = new Map(); // tokenAccount -> subId
   
+  // Wallet logs subscription for new token buys
+  private walletLogsSubId: number | null = null;
+  
   // Cached balances: tokenAccount -> amount
   private cachedBalances: Map<string, bigint> = new Map();
   
@@ -143,8 +148,15 @@ export class HeliusWsClient {
             const balanceTokenAccount = this.pendingBalanceSubs.get(requestId);
             if (balanceTokenAccount) {
               this.pendingBalanceSubs.delete(requestId);
-              this.balanceSubscriptions.set(subId, balanceTokenAccount);
-              this.tokenAccountToBalanceSubId.set(balanceTokenAccount, subId);
+              
+              // Check if this is a wallet subscription
+              if (balanceTokenAccount.startsWith('wallet:')) {
+                this.walletLogsSubId = subId;
+                console.log('[Helius] Subscribed to wallet logs');
+              } else {
+                this.balanceSubscriptions.set(subId, balanceTokenAccount);
+                this.tokenAccountToBalanceSubId.set(balanceTokenAccount, subId);
+              }
               return;
             }
             
@@ -160,7 +172,15 @@ export class HeliusWsClient {
 
           // Handle logs notifications
           if (response.method === 'logsNotification') {
-            this.handleLogsNotification(response);
+            const subId = response.params?.subscription;
+            // Check if this is wallet logs notification
+            if (subId === this.walletLogsSubId) {
+              const signature = response.params?.result?.value?.signature;
+              const logs = response.params?.result?.value?.logs || [];
+              this.handleWalletLogsNotification(signature, logs);
+            } else {
+              this.handleLogsNotification(response);
+            }
           }
           
           // Handle account notifications (for balance caching)
@@ -324,6 +344,83 @@ export class HeliusWsClient {
 
     this.ws.send(JSON.stringify(request));
     this.subscriptions.delete(subscriptionId);
+  }
+
+  /**
+   * Subscribe to wallet logs to detect new token buys
+   */
+  subscribeToWalletLogs(walletAddress: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'logsSubscribe',
+      params: [
+        {
+          mentions: [walletAddress],
+        },
+        {
+          commitment: 'processed',
+        },
+      ],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    
+    // Store requestId as placeholder for wallet sub
+    this.pendingBalanceSubs.set(this.requestId, `wallet:${walletAddress}`);
+  }
+
+  /**
+   * Handle wallet logs notification to detect new token buys
+   */
+  private handleWalletLogsNotification(signature: string, logs: string[]): void {
+    // Look for SPL token mint or transfer to wallet indicating a buy
+    // Parse logs to find new token mints
+    for (const log of logs) {
+      // Match "Program log: Mint: <address>" or similar patterns
+      const mintMatch = log.match(/Program log: Mint:\s*([A-Za-z0-9]{32,44})/i);
+      if (mintMatch) {
+        const tokenMint = mintMatch[1];
+        // Skip SOL mint
+        if (tokenMint !== 'So11111111111111111111111111111111111111112') {
+          this.config.onNewToken?.(tokenMint, signature);
+          return;
+        }
+      }
+      
+      // Also detect via TokenkegQfeZyiNwAJbNbGKPFXCWuBf9F2sTMzSt8
+      // Program TokenkegQfeZyiNwAJbNbGKPFXCWuBf9F2sTMzSt8 invoke
+      // Look for new token account creation
+      if (log.includes('TokenkegQfeZyiNwAJbNbGKPFXCWuBf9F2sTMzSt8') || 
+          log.includes('TokenzQdBNbL2PyPQvZsLMjJqLmzT2ULi6pUgqHmNp')) {
+        // Check for InitializeAccount3 or similar - indicates new token account
+        if (log.includes('InitializeAccount') || log.includes('InitializeMint')) {
+          // Extract mint from subsequent logs
+          const mintInLogs = logs.find(l => 
+            l.includes('Program log:') && 
+            l.match(/[A-Za-z0-9]{32,44}/)
+          );
+          if (mintInLogs) {
+            const possibleMint = mintInLogs.match(/([A-Za-z0-9]{32,44})/g);
+            if (possibleMint) {
+              // Filter out known program IDs and find the mint
+              for (const addr of possibleMint) {
+                if (addr.length >= 32 && addr !== 'So11111111111111111111111111111111111111112') {
+                  // This could be a token mint - trigger callback
+                  this.config.onNewToken?.(addr, signature);
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -531,7 +628,35 @@ export class HeliusWsClient {
       return [];
     } catch (error) {
       console.error(`[Helius] Failed to get wallet token accounts: ${error}`);
-      throw error;
+      return [];
+    }
+  }
+
+  /**
+   * Get token account balance via RPC
+   */
+  async getTokenAccountBalance(tokenAccount: string): Promise<{ value: { amount: string } } | null> {
+    try {
+      const response = await fetch(this.config.rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'getTokenAccountBalance',
+          params: [tokenAccount, { commitment: 'processed' }],
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json() as { result?: { value: { amount: string } } };
+      return data.result ?? null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get token account balance: ${error}`);
+      return null;
     }
   }
 
