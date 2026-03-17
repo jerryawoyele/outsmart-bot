@@ -1,6 +1,10 @@
 import WebSocket from 'ws';
 import { TokenPosition } from './types.js';
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Retry a function with exponential backoff
  */
@@ -20,7 +24,7 @@ async function retryWithBackoff<T>(
       if (attempt < maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt - 1);
         console.log(`[Helius] Retry ${attempt}/${maxRetries} for ${name} in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        await sleep(delay);
       }
     }
   }
@@ -31,9 +35,10 @@ async function retryWithBackoff<T>(
 export interface HeliusWsConfig {
   wsUrl: string;
   rpcUrl: string;
-  walletAddress?: string; // For wallet logs subscription
+  walletAddress?: string;
   onLiquidityRemoval?: (tokenMint: string, signature: string) => void;
   onNewToken?: (tokenMint: string, signature: string) => void;
+  onUserTokenBalanceChange?: (tokenAccount: string, amount: bigint) => void;
   onError?: (error: Error) => void;
   onConnect?: () => void;
 }
@@ -110,6 +115,11 @@ export class HeliusWsClient {
   private reconnectDelay = 1000;
   private isReconnecting = false;
 
+  // Very lightweight pacing for free-tier-friendly HTTP usage
+  private nextHttpAt = 0;
+  private httpTail: Promise<void> = Promise.resolve();
+  private readonly minHttpIntervalMs = 175;
+
   constructor(config: HeliusWsConfig) {
     this.config = config;
   }
@@ -119,6 +129,73 @@ export class HeliusWsClient {
    */
   getCachedBalance(tokenAccount: string): bigint | undefined {
     return this.cachedBalances.get(tokenAccount);
+  }
+
+  private async waitForHttpSlot(): Promise<void> {
+    let release!: () => void;
+    const prev = this.httpTail;
+    this.httpTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await prev;
+
+    const now = Date.now();
+    const waitMs = Math.max(0, this.nextHttpAt - now);
+    if (waitMs > 0) await sleep(waitMs);
+    this.nextHttpAt = Date.now() + this.minHttpIntervalMs;
+
+    release();
+  }
+
+  private async rpcJson<T>(body: unknown, name: string): Promise<T> {
+    return retryWithBackoff(
+      async () => {
+        await this.waitForHttpSlot();
+
+        const response = await fetch(this.config.rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (response.status === 429) {
+          throw new Error(`HTTP 429 Too Many Requests`);
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return response.json() as Promise<T>;
+      },
+      4,
+      500,
+      name
+    );
+  }
+
+  private async httpJson<T>(url: string, name: string): Promise<T> {
+    return retryWithBackoff(
+      async () => {
+        await this.waitForHttpSlot();
+
+        const response = await fetch(url);
+
+        if (response.status === 429) {
+          throw new Error(`HTTP 429 Too Many Requests`);
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return response.json() as Promise<T>;
+      },
+      4,
+      500,
+      name
+    );
   }
 
   /**
@@ -221,6 +298,7 @@ export class HeliusWsClient {
         const amount = decodeTokenAmount(data);
         if (amount !== null) {
           this.cachedBalances.set(tokenAccount, amount);
+          this.config.onUserTokenBalanceChange?.(tokenAccount, amount);
         }
       }
     }
@@ -446,42 +524,29 @@ export class HeliusWsClient {
    */
   async getUserTokenAccount(walletAddress: string, tokenMint: string): Promise<string | null> {
     try {
-      const data = await retryWithBackoff(
-        async () => {
-          const response = await fetch(this.config.rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: '1',
-              method: 'getTokenAccounts',
-              params: {
-                owner: walletAddress,
-                mint: tokenMint,
-              },
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-          }
-
-          return response.json() as Promise<{ result?: { token_accounts?: Array<{ address: string; amount?: number }> } }>;
+      const data = await this.rpcJson<{
+        result?: { token_accounts?: Array<{ address: string; amount?: number }> };
+      }>(
+        {
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'getTokenAccounts',
+          params: {
+            owner: walletAddress,
+            mint: tokenMint,
+          },
         },
-        3,
-        1000,
-        `getUserTokenAccount(${tokenMint.slice(0, 8)}...)`
+        `getUserTokenAccount(${tokenMint.slice(0, 8)}...)` 
       );
       
-      if (data.result?.token_accounts && data.result.token_accounts.length > 0) {
+      if (data.result?.token_accounts?.length) {
         const acc = data.result.token_accounts[0];
-        // Seed the cache with initial balance
         if (acc.amount !== undefined) {
           this.cachedBalances.set(acc.address, BigInt(acc.amount));
         }
         return acc.address;
       }
-      
+
       return null;
     } catch (error) {
       console.error(`[Helius] Failed to get user token account: ${error}`);
@@ -494,37 +559,25 @@ export class HeliusWsClient {
    */
   async getDevTokenAccount(devAddress: string, tokenMint: string): Promise<string | null> {
     try {
-      const data = await retryWithBackoff(
-        async () => {
-          const response = await fetch(this.config.rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: '1',
-              method: 'getTokenAccounts',
-              params: {
-                owner: devAddress,
-                mint: tokenMint,
-              },
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-          }
-
-          return response.json() as Promise<{ result?: { token_accounts?: Array<{ address: string }> } }>;
+      const data = await this.rpcJson<{
+        result?: { token_accounts?: Array<{ address: string }> };
+      }>(
+        {
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'getTokenAccounts',
+          params: {
+            owner: devAddress,
+            mint: tokenMint,
+          },
         },
-        3,
-        1000,
-        `getDevTokenAccount(${tokenMint.slice(0, 8)}...)`
+        `getDevTokenAccount(${tokenMint.slice(0, 8)}...)` 
       );
       
-      if (data.result?.token_accounts && data.result.token_accounts.length > 0) {
+      if (data.result?.token_accounts?.length) {
         return data.result.token_accounts[0].address;
       }
-      
+
       return null;
     } catch (error) {
       console.error(`[Helius] Failed to get dev token account: ${error}`);
@@ -533,46 +586,45 @@ export class HeliusWsClient {
   }
 
   /**
-   * Get pool address from dev token account's CLOSE_ACCOUNT transaction
+   * Get CLMM pool address from dev token account's CLOSE_ACCOUNT transaction
+   * The pool address is the toUserAccount in the first tokenTransfer
    */
   async getPoolFromDevTokenAccount(devTokenAccount: string): Promise<string | null> {
     try {
       const heliusApiKey = this.config.rpcUrl.split('api-key=')[1];
       if (!heliusApiKey) return null;
 
-      const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${devTokenAccount}/transactions?token-accounts=none&sort-order=asc&api-key=${heliusApiKey}&type=CLOSE_ACCOUNT&source=SOLANA_PROGRAM_LIBRARY`;
+      const url =
+        `https://api-mainnet.helius-rpc.com/v0/addresses/${devTokenAccount}/transactions` +
+        `?token-accounts=none&sort-order=asc&api-key=${heliusApiKey}` +
+        `&type=CLOSE_ACCOUNT&source=SOLANA_PROGRAM_LIBRARY`;
 
-      const response = await retryWithBackoff(
-        async () => {
-          const res = await fetch(url);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          return res;
-        },
-        3,
-        1000,
-        `getPoolFromDevTokenAccount(${devTokenAccount.slice(0, 8)}...)`
-      );
-
-      const transactions = await response.json() as Array<{
-        type: string;
-        tokenTransfers?: Array<{
-          fromTokenAccount: string;
-          toTokenAccount: string;
-          fromUserAccount: string;
-          toUserAccount: string;
-          mint: string;
-        }>;
-      }>;
+      const transactions = await this.httpJson<
+        Array<{
+          type: string;
+          tokenTransfers?: Array<{
+            fromTokenAccount: string;
+            toTokenAccount: string;
+            fromUserAccount: string;
+            toUserAccount: string;
+            mint: string;
+          }>;
+        }>
+      >(url, `getPoolFromDevTokenAccount(${devTokenAccount.slice(0, 8)}...)`);
 
       for (const tx of transactions) {
-        if (tx.tokenTransfers && tx.tokenTransfers.length >= 1) {
-          return tx.tokenTransfers[0].toUserAccount;
+        if (tx.tokenTransfers?.length) {
+          const poolAddress = tx.tokenTransfers[0].toUserAccount;
+          if (poolAddress) {
+            console.log(`[Helius] Found CLMM pool: ${poolAddress.slice(0, 12)}...`);
+            return poolAddress;
+          }
         }
       }
 
       return null;
     } catch (error) {
-      console.error(`[Helius] Failed to get pool: ${error}`);
+      console.error(`[Helius] Failed to get pool from dev token account: ${error}`);
       return null;
     }
   }
@@ -582,49 +634,35 @@ export class HeliusWsClient {
    */
   async getWalletTokenAccounts(walletAddress: string): Promise<Array<{ tokenAccount: string; mint: string; amount: string; decimals: number }>> {
     try {
-      const data = await retryWithBackoff(
-        async () => {
-          const response = await fetch(this.config.rpcUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              jsonrpc: '2.0',
-              id: '1',
-              method: 'getTokenAccounts',
-              params: {
-                owner: walletAddress,
-              },
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-          }
-
-          return response.json() as Promise<{ 
-            result?: { 
-              token_accounts?: Array<{ 
-                address: string;
-                mint: string; 
-                amount: number;
-              }> 
-            } 
+      const data = await this.rpcJson<{
+        result?: {
+          token_accounts?: Array<{
+            address: string;
+            mint: string;
+            amount: number;
           }>;
+        };
+      }>(
+        {
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'getTokenAccounts',
+          params: {
+            owner: walletAddress,
+          },
         },
-        3,
-        1000,
         'getWalletTokenAccounts'
       );
-      
+
       if (data.result?.token_accounts) {
-        return data.result.token_accounts.map(acc => ({
+        return data.result.token_accounts.map((acc) => ({
           tokenAccount: acc.address,
           mint: acc.mint,
           amount: acc.amount.toString(),
           decimals: 6,
         }));
       }
-      
+
       return [];
     } catch (error) {
       console.error(`[Helius] Failed to get wallet token accounts: ${error}`);
@@ -637,22 +675,21 @@ export class HeliusWsClient {
    */
   async getTokenAccountBalance(tokenAccount: string): Promise<{ value: { amount: string } } | null> {
     try {
-      const response = await fetch(this.config.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const cached = this.cachedBalances.get(tokenAccount);
+      if (cached !== undefined) {
+        return { value: { amount: cached.toString() } };
+      }
+
+      const data = await this.rpcJson<{ result?: { value: { amount: string } } }>(
+        {
           jsonrpc: '2.0',
           id: '1',
           method: 'getTokenAccountBalance',
           params: [tokenAccount, { commitment: 'processed' }],
-        }),
-      });
+        },
+        `getTokenAccountBalance(${tokenAccount.slice(0, 8)}...)` 
+      );
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = await response.json() as { result?: { value: { amount: string } } };
       return data.result ?? null;
     } catch (error) {
       console.error(`[Helius] Failed to get token account balance: ${error}`);
