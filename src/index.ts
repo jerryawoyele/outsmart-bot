@@ -11,10 +11,16 @@ import { TokenPosition } from "./types.js";
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
 
 interface BotConfig {
-  heliusWsUrl: string;
-  rpcUrl: string;
+  heliusWsBaseUrl: string; // Base WS URL without API key
+  heliusHttpBaseUrl: string; // Base HTTP URL without API key
   walletAddress: string;
   privateKey: string;
+
+  // Helius plan: "free" or "paid"
+  // - free: Each position gets its own API key (max 5 positions)
+  // - paid: Single API key handles all positions
+  heliusPlan: "free" | "paid";
+  heliusApiKeys: string[]; // Array of API keys for free plan
 
   flashblockApiKey: string;
   flashblockUrl: string;
@@ -48,6 +54,7 @@ interface MonitoredPosition {
   tokenRefreshInFlight?: boolean;
   templateRefreshInFlight?: boolean;
   templateRefreshQueued?: boolean;
+  heliusApiKeyIndex?: number; // Which API key is assigned to this position (for free plan)
 }
 
 /**
@@ -92,6 +99,99 @@ class RugDefenseBot {
   // Per-position pre-computed contexts (continuously updated)
   private monitoredPositions: Map<string, MonitoredPosition> = new Map();
 
+  // API key assignment tracking (for free plan)
+  private usedApiKeys: Set<number> = new Set(); // Indices of used API keys
+  private positionToApiKey: Map<string, number> = new Map(); // tokenMint -> apiKeyIndex
+
+  /**
+   * Assign an available API key to a position.
+   * Returns the index of the assigned key, or -1 if none available.
+   */
+  private assignApiKey(tokenMint: string): number {
+    if (this.config.heliusPlan === "paid") {
+      return 0; // Paid plan uses single key
+    }
+
+    // Find first available key
+    for (let i = 0; i < this.config.heliusApiKeys.length; i++) {
+      if (!this.usedApiKeys.has(i)) {
+        this.usedApiKeys.add(i);
+        this.positionToApiKey.set(tokenMint, i);
+        console.log(`[Bot] Assigned API key #${i + 1} to ${tokenMint.slice(0, 8)}...`);
+        return i;
+      }
+    }
+
+    return -1; // No keys available
+  }
+
+  /**
+   * Release an API key when a position is sold.
+   */
+  private releaseApiKey(tokenMint: string): void {
+    const index = this.positionToApiKey.get(tokenMint);
+    if (index !== undefined) {
+      this.usedApiKeys.delete(index);
+      this.positionToApiKey.delete(tokenMint);
+      console.log(`[Bot] Released API key #${index + 1} from ${tokenMint.slice(0, 8)}...`);
+    }
+  }
+
+  /**
+   * Get the API key assigned to a position.
+   */
+  private getApiKeyForPosition(tokenMint: string): string | undefined {
+    const index = this.positionToApiKey.get(tokenMint);
+    if (index === undefined) return undefined;
+    return this.config.heliusApiKeys[index];
+  }
+
+  /**
+   * Check if we have capacity for a new position.
+   * For free plan: must have unused API keys.
+   */
+  private hasCapacityForNewPosition(): boolean {
+    if (this.config.heliusPlan === "paid") {
+      return true; // Paid plan has no limit
+    }
+    return this.usedApiKeys.size < this.config.heliusApiKeys.length;
+  }
+
+  /**
+   * Get HTTP RPC URL for a specific position (with its assigned API key).
+   * For paid plan, uses the first API key.
+   */
+  private getHttpUrlForPosition(tokenMint: string): string {
+    const apiKey = this.getApiKeyForPosition(tokenMint) || this.config.heliusApiKeys[0];
+    if (!apiKey) {
+      throw new Error("No API key available");
+    }
+    return `${this.config.heliusHttpBaseUrl}/?api-key=${apiKey}`;
+  }
+
+  /**
+   * Get WS URL for a specific position (with its assigned API key).
+   * For paid plan, uses the first API key.
+   */
+  private getWsUrlForPosition(tokenMint: string): string {
+    const apiKey = this.getApiKeyForPosition(tokenMint) || this.config.heliusApiKeys[0];
+    if (!apiKey) {
+      throw new Error("No API key available");
+    }
+    return `${this.config.heliusWsBaseUrl}/?api-key=${apiKey}`;
+  }
+
+  /**
+   * Get HTTP URL using first API key (for general operations before positions are assigned).
+   */
+  private getInitialHttpUrl(): string {
+    const apiKey = this.config.heliusApiKeys[0];
+    if (!apiKey) {
+      throw new Error("No API key available");
+    }
+    return `${this.config.heliusHttpBaseUrl}/?api-key=${apiKey}`;
+  }
+
   constructor(config: BotConfig) {
     this.config = {
       ...config,
@@ -111,11 +211,16 @@ class RugDefenseBot {
       flashblockBackupUrl: config.flashblockBackupUrl ?? "",
     };
 
-    this.connection = new Connection(config.rpcUrl, this.config.commitment);
+    // Build initial HTTP URL with first API key
+    const initialHttpUrl = this.getInitialHttpUrl();
+    this.connection = new Connection(initialHttpUrl, this.config.commitment);
+
+    // Build initial WS URL with first API key
+    const initialWsUrl = `${config.heliusWsBaseUrl}/?api-key=${config.heliusApiKeys[0] || ""}`;
 
     this.heliusClient = new HeliusWsClient({
-      wsUrl: config.heliusWsUrl,
-      rpcUrl: config.rpcUrl,
+      wsUrl: initialWsUrl,
+      rpcUrl: initialHttpUrl,
       walletAddress: config.walletAddress,
       onLiquidityRemoval: this.handleLiquidityRemoval.bind(this),
       onNewToken: this.handleNewToken.bind(this),
@@ -125,12 +230,12 @@ class RugDefenseBot {
     });
 
     this.positionTracker = new PositionTracker({
-      rpcUrl: config.rpcUrl,
+      rpcUrl: initialHttpUrl,
       walletAddress: config.walletAddress,
     });
 
     this.seller = new ClmmSeller({
-      rpcUrl: config.rpcUrl,
+      rpcUrl: initialHttpUrl,
       privateKey: config.privateKey,
       flashblockApiKey: config.flashblockApiKey,
       flashblockUrl: config.flashblockUrl,
@@ -510,6 +615,9 @@ class RugDefenseBot {
     if (monitored.poolSnapshotTimer) clearInterval(monitored.poolSnapshotTimer);
     if (monitored.tokenBalanceTimer) clearInterval(monitored.tokenBalanceTimer);
 
+    // Release the API key assigned to this position
+    this.releaseApiKey(tokenMint);
+
     this.monitoredPositions.delete(tokenMint);
   }
 
@@ -623,9 +731,29 @@ class RugDefenseBot {
   ): Promise<void> {
     console.log(`[Bot] Setting up monitoring for: ${tokenMint.slice(0, 8)}...`);
 
+    // Check if we have capacity for a new position (free plan limit)
+    if (!this.hasCapacityForNewPosition()) {
+      console.warn(
+        `[Bot] ⚠️ No API keys available for ${tokenMint.slice(0, 8)}... - NOT monitoring (free plan limit reached)`,
+      );
+      console.warn(
+        `[Bot] Position will not be rug-protected. Consider upgrading to paid plan or selling manually.`,
+      );
+      return;
+    }
+
     const devAddress = await this.positionTracker.findTokenDev(tokenMint);
     if (!devAddress) {
       console.warn(`[Bot] Could not find dev for ${tokenMint.slice(0, 8)}...`);
+      return;
+    }
+
+    // Assign an API key to this position
+    const keyIndex = this.assignApiKey(tokenMint);
+    if (keyIndex < 0) {
+      console.warn(
+        `[Bot] ⚠️ Failed to assign API key to ${tokenMint.slice(0, 8)}... - NOT monitoring`,
+      );
       return;
     }
 
@@ -826,11 +954,12 @@ class RugDefenseBot {
 // Main entry point
 async function main() {
   const requiredEnvVars = [
-    "HELIUS_WS_URL",
-    "MAINNET_ENDPOINT",
+    "HELIUS_WS_BASE_URL",
+    "HELIUS_HTTP_BASE_URL",
     "PRIVATE_KEY",
     "FLASHBLOCK_API_KEY",
     "FLASHBLOCK_URL",
+    "HELIUS_PLAN",
   ];
   for (const envVar of requiredEnvVars) {
     if (!process.env[envVar]) {
@@ -843,11 +972,30 @@ async function main() {
     throw new Error("WALLET_ADDRESS environment variable is required");
   }
 
+  const heliusPlan = (process.env.HELIUS_PLAN || "free") as "free" | "paid";
+
+  // Parse API keys from environment
+  const heliusApiKeys: string[] = [];
+  for (let i = 1; i <= 5; i++) {
+    const key = process.env[`HELIUS_API_KEY_${i}`];
+    if (key && key !== `your_${["second", "third", "fourth", "fifth"][i - 1] || "first"}_helius_api_key_here`) {
+      heliusApiKeys.push(key);
+    }
+  }
+
+  if (heliusPlan === "free" && heliusApiKeys.length === 0) {
+    throw new Error("HELIUS_PLAN=free requires at least one HELIUS_API_KEY_N to be set");
+  }
+
+  console.log(`[Bot] Helius plan: ${heliusPlan}, API keys available: ${heliusApiKeys.length}`);
+
   const bot = new RugDefenseBot({
-    heliusWsUrl: process.env.HELIUS_WS_URL!,
-    rpcUrl: process.env.MAINNET_ENDPOINT!,
+    heliusWsBaseUrl: process.env.HELIUS_WS_BASE_URL!,
+    heliusHttpBaseUrl: process.env.HELIUS_HTTP_BASE_URL!,
     walletAddress,
     privateKey: process.env.PRIVATE_KEY!,
+    heliusPlan,
+    heliusApiKeys,
     flashblockApiKey: process.env.FLASHBLOCK_API_KEY!,
     flashblockUrl: process.env.FLASHBLOCK_URL!,
     flashblockBackupUrl: process.env.FLASHBLOCK_BACKUP_URL,
