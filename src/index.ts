@@ -853,7 +853,7 @@ async function main() {
     flashblockBackupUrl: process.env.FLASHBLOCK_BACKUP_URL,
     defaultSlippageBps: parseInt(process.env.DEFAULT_SLIPPAGE_BPS || "10000"),
     priorityFeeMicroLamports: parseInt(
-      process.env.PRIORITY_FEE_MICRO_LAMPORTS || "200000",
+      process.env.PRIORITY_FEE_MICRO_LAMPORTS || "120000",
     ),
     computeUnits: parseInt(process.env.COMPUTE_UNITS || "1000000"),
     tipLamports: parseInt(process.env.TIP_LAMPORTS || "200000"),

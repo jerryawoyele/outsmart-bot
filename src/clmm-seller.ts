@@ -16,6 +16,7 @@ import {
   TOKEN_PROGRAM_ID,
   getAssociatedTokenAddress,
   createCloseAccountInstruction,
+  createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
 import {
   Raydium,
@@ -36,7 +37,7 @@ import {
  */
 
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
-const MIN_TIP_LAMPORTS = 200_000;
+const MIN_TIP_LAMPORTS = 500_000;
 
 /**
  * Keep your current tip wallet list for now.
@@ -160,12 +161,13 @@ export class ClmmSeller {
   private readonly flashblockUrls: string[];
   private readonly flashblockApiKey: string;
   private raydium: Awaited<ReturnType<typeof Raydium.load>> | null = null;
+  private wsolAta: PublicKey | null = null;
 
   constructor(config: ClmmSellerConfig) {
     this.config = {
       commitment: config.commitment ?? "processed",
       defaultSlippageBps: config.defaultSlippageBps ?? 10_000,
-      priorityFeeMicroLamports: config.priorityFeeMicroLamports ?? 200_000,
+      priorityFeeMicroLamports: config.priorityFeeMicroLamports ?? 120_000,
       computeUnits: config.computeUnits ?? 1_000_000,
       tipLamports: Math.max(
         config.tipLamports ?? MIN_TIP_LAMPORTS,
@@ -229,7 +231,72 @@ export class ClmmSeller {
       disableLoadToken: true,
     });
 
+    // Compute and cache WSOL ATA address (deterministic, no RPC needed)
+    const wsolMint = new PublicKey(DEFAULT_WSOL_MINT);
+    this.wsolAta = await getAssociatedTokenAddress(wsolMint, this.owner.publicKey);
+
+    // Ensure WSOL ATA exists (one-time check at startup, off hot path)
+    await this.ensureWsolAtaExists();
+
     console.log(`[ClmmSeller] Initialized for ${owner.toBase58()}`);
+  }
+
+  /**
+   * Get cached WSOL ATA address (no RPC call).
+   * Safe to call on hot path - just returns cached address.
+   */
+  getWsolAta(): PublicKey {
+    if (!this.wsolAta) {
+      throw new Error("WSOL ATA not initialized - call initialize() first");
+    }
+    return this.wsolAta;
+  }
+
+  /**
+   * Ensure WSOL ATA exists (one-time at startup).
+   * NOT called on hot path - initialized once before any trading.
+   */
+  private async ensureWsolAtaExists(): Promise<void> {
+    if (!this.wsolAta) return;
+
+    const accountInfo = await this.connection.getAccountInfo(this.wsolAta);
+    if (accountInfo) {
+      console.log(`[ClmmSeller] WSOL ATA exists: ${this.wsolAta.toBase58().slice(0, 12)}...`);
+      return;
+    }
+
+    // Create WSOL ATA (one-time setup)
+    console.log(`[ClmmSeller] Creating WSOL ATA: ${this.wsolAta.toBase58().slice(0, 12)}...`);
+
+    const wsolMint = new PublicKey(DEFAULT_WSOL_MINT);
+    const createAtaIx = createAssociatedTokenAccountInstruction(
+      this.owner.publicKey,
+      this.wsolAta,
+      this.owner.publicKey,
+      wsolMint,
+      TOKEN_PROGRAM_ID
+    );
+
+    const { blockhash, lastValidBlockHeight } =
+      await this.connection.getLatestBlockhash('processed');
+
+    const tx = new Transaction();
+    tx.feePayer = this.owner.publicKey;
+    tx.recentBlockhash = blockhash;
+    tx.add(createAtaIx);
+    tx.sign(this.owner);
+
+    const sig = await this.connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true,
+      maxRetries: 0,
+    });
+
+    await this.connection.confirmTransaction(
+      { blockhash, lastValidBlockHeight, signature: sig },
+      'processed'
+    );
+
+    console.log(`[ClmmSeller] WSOL ATA created: ${sig.slice(0, 12)}...`);
   }
 
   /**
@@ -319,11 +386,8 @@ export class ClmmSeller {
 
     const unwrapWsol = params.unwrapWsol ?? true;
     if (unwrapWsol) {
-      const wsolMint = new PublicKey(DEFAULT_WSOL_MINT);
-      const wsolAta = await getAssociatedTokenAddress(
-        wsolMint,
-        this.owner.publicKey,
-      );
+      // Use cached WSOL ATA (no async call needed)
+      const wsolAta = this.getWsolAta();
       const closeWsolIx = createCloseAccountInstruction(
         wsolAta,
         this.owner.publicKey,
@@ -469,15 +533,20 @@ export class ClmmSeller {
     finalTx.feePayer = tx.feePayer ?? this.owner.publicKey;
     finalTx.recentBlockhash = tx.recentBlockhash;
 
+    // Optimal order for fast bots:
+    // 1. Compute budget instructions
+    // 2. Tip transfer (before swap for priority)
+    // 3. Swap instructions
+    // 4. Cleanup / close WSOL
     finalTx.add(
       ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
       ComputeBudgetProgram.setComputeUnitPrice({
         microLamports: priorityFeeMicroLamports,
       }),
+      tipIx
     );
 
     for (const ix of tx.instructions) finalTx.add(ix);
-    finalTx.add(tipIx);
 
     return finalTx;
   }
