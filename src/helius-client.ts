@@ -315,6 +315,18 @@ export class HeliusWsClient {
     
     const { position } = subInfo;
     const signature = response.params?.result?.value?.signature;
+    const err = response.params?.result?.value?.err;
+    
+    // Skip failed transactions
+    if (err) {
+      console.log(`[Helius] Failed tx for ${position.tokenMint.slice(0, 8)}...: ${signature?.slice(0, 12)}...`);
+      return;
+    }
+    
+    console.log(
+      `[Helius] 🚨 LIQUIDITY REMOVAL DETECTED - token: ${position.tokenMint.slice(0, 12)}... ` +
+      `sig: ${signature?.slice(0, 12)}...`
+    );
     
     // Trigger sell - don't unsubscribe here, let caller handle after sell
     this.config.onLiquidityRemoval?.(position.tokenMint, signature || '');

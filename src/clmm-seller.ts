@@ -43,16 +43,16 @@ const MIN_TIP_LAMPORTS = 200_000;
  * If you later get official FlashBlock-specific tip wallets, replace this list.
  */
 const RELAY_TIP_WALLETS = [
-"FLaShB3iXXTWE1vu9wQsChUKq3HFtpMAhb8kAh1pf1wi",
-"FLashhsorBmM9dLpuq6qATawcpqk1Y2aqaZfkd48iT3W",
-"FLaSHJNm5dWYzEgnHJWWJP5ccu128Mu61NJLxUf7mUXU",
-"FLaSHR4Vv7sttd6TyDF4yR1bJyAxRwWKbohDytEMu3wL",
-"FLASHRzANfcAKDuQ3RXv9hbkBy4WVEKDzoAgxJ56DiE4",
-"FLasHstqx11M8W56zrSEqkCyhMCCpr6ze6Mjdvqope5s",
-"FLAShWTjcweNT4NSotpjpxAkwxUr2we3eXQGhpTVzRwy",
-"FLasHXTqrbNvpWFB6grN47HGZfK6pze9HLNTgbukfPSk",
-"FLAshyAyBcKb39KPxSzXcepiS8iDYUhDGwJcJDPX4g2B",
-"FLAsHZTRcf3Dy1APaz6j74ebdMC6Xx4g6i9YxjyrDybR",
+  "FLaShB3iXXTWE1vu9wQsChUKq3HFtpMAhb8kAh1pf1wi",
+  "FLashhsorBmM9dLpuq6qATawcpqk1Y2aqaZfkd48iT3W",
+  "FLaSHJNm5dWYzEgnHJWWJP5ccu128Mu61NJLxUf7mUXU",
+  "FLaSHR4Vv7sttd6TyDF4yR1bJyAxRwWKbohDytEMu3wL",
+  "FLASHRzANfcAKDuQ3RXv9hbkBy4WVEKDzoAgxJ56DiE4",
+  "FLasHstqx11M8W56zrSEqkCyhMCCpr6ze6Mjdvqope5s",
+  "FLAShWTjcweNT4NSotpjpxAkwxUr2we3eXQGhpTVzRwy",
+  "FLasHXTqrbNvpWFB6grN47HGZfK6pze9HLNTgbukfPSk",
+  "FLAshyAyBcKb39KPxSzXcepiS8iDYUhDGwJcJDPX4g2B",
+  "FLAsHZTRcf3Dy1APaz6j74ebdMC6Xx4g6i9YxjyrDybR",
 ] as const;
 
 type FlashBlockResp = {
@@ -167,7 +167,10 @@ export class ClmmSeller {
       defaultSlippageBps: config.defaultSlippageBps ?? 10_000,
       priorityFeeMicroLamports: config.priorityFeeMicroLamports ?? 200_000,
       computeUnits: config.computeUnits ?? 1_000_000,
-      tipLamports: Math.max(config.tipLamports ?? MIN_TIP_LAMPORTS, MIN_TIP_LAMPORTS),
+      tipLamports: Math.max(
+        config.tipLamports ?? MIN_TIP_LAMPORTS,
+        MIN_TIP_LAMPORTS,
+      ),
       confirmAfterSend: config.confirmAfterSend ?? false,
       flashblockBackupUrl: config.flashblockBackupUrl ?? "",
     };
@@ -180,7 +183,7 @@ export class ClmmSeller {
       .map((u) => u!.replace(/\/+$/, "") + "/");
 
     this.raydiumHttp = axios.create({
-      timeout: 5000,
+      timeout: 2000,
       validateStatus: () => true,
       httpsAgent: new https.Agent({
         keepAlive: true,
@@ -202,9 +205,12 @@ export class ClmmSeller {
     if (this.raydium) return;
 
     const owner = this.owner.publicKey;
-    const tokenAccountResp = await this.connection.getTokenAccountsByOwner(owner, {
-      programId: TOKEN_PROGRAM_ID,
-    });
+    const tokenAccountResp = await this.connection.getTokenAccountsByOwner(
+      owner,
+      {
+        programId: TOKEN_PROGRAM_ID,
+      },
+    );
 
     const tokenAccountData = parseTokenAccountResp({
       owner,
@@ -238,7 +244,13 @@ export class ClmmSeller {
     const slippageBps = params.slippageBps ?? this.config.defaultSlippageBps;
     const slippage = slippageBps / 10_000;
 
-    if (!ctx.poolInfo || !ctx.computePoolInfo || !ctx.tickData || !ctx.epochInfo) return;
+    if (
+      !ctx.poolInfo ||
+      !ctx.computePoolInfo ||
+      !ctx.tickData ||
+      !ctx.epochInfo
+    )
+      return;
     if (!ctx.tokenOut) return;
     if (!ctx.blockhash) return;
     if (ctx.tokenAmountRaw <= 0n) {
@@ -308,13 +320,16 @@ export class ClmmSeller {
     const unwrapWsol = params.unwrapWsol ?? true;
     if (unwrapWsol) {
       const wsolMint = new PublicKey(DEFAULT_WSOL_MINT);
-      const wsolAta = await getAssociatedTokenAddress(wsolMint, this.owner.publicKey);
+      const wsolAta = await getAssociatedTokenAddress(
+        wsolMint,
+        this.owner.publicKey,
+      );
       const closeWsolIx = createCloseAccountInstruction(
         wsolAta,
         this.owner.publicKey,
         this.owner.publicKey,
         [],
-        TOKEN_PROGRAM_ID
+        TOKEN_PROGRAM_ID,
       );
       rawBuiltTx.add(closeWsolIx);
     }
@@ -323,7 +338,7 @@ export class ClmmSeller {
       rawBuiltTx,
       ctx.priorityFeeMicroLamports,
       ctx.computeUnits,
-      ctx.tipLamports
+      ctx.tipLamports,
     );
 
     templateTx.feePayer = this.owner.publicKey;
@@ -343,7 +358,8 @@ export class ClmmSeller {
       await this.initialize();
 
       const { ctx } = params;
-      const confirmAfterSend = params.confirmAfterSend ?? this.config.confirmAfterSend;
+      const confirmAfterSend =
+        params.confirmAfterSend ?? this.config.confirmAfterSend;
 
       if (ctx.tokenAmountRaw <= 0n) {
         return { success: false, error: "No balance to sell" };
@@ -352,7 +368,7 @@ export class ClmmSeller {
       const feeBudget = this.estimateRequiredFeeLamports(
         ctx.computeUnits,
         ctx.priorityFeeMicroLamports,
-        ctx.tipLamports
+        ctx.tipLamports,
       );
 
       if (ctx.lamportsBalance < feeBudget) {
@@ -363,6 +379,9 @@ export class ClmmSeller {
       }
 
       if (!ctx.preparedTx) {
+        console.warn(
+          "[ClmmSeller] No prepared template at trigger; rebuilding on hot path",
+        );
         await this.prepareSellTemplate({
           ctx,
           sellPercent: params.sellPercent,
@@ -390,7 +409,7 @@ export class ClmmSeller {
             lastValidBlockHeight: ctx.lastValidBlockHeight,
             signature: sig,
           },
-          "processed"
+          "processed",
         );
       }
 
@@ -419,11 +438,11 @@ export class ClmmSeller {
     computeUnits: number,
     priorityFeeMicroLamports: number,
     tipLamports: number,
-    signatures = 1
+    signatures = 1,
   ): number {
     const baseFee = 5_000 * signatures;
     const priorityFeeLamports = Math.ceil(
-      (computeUnits * priorityFeeMicroLamports) / 1_000_000
+      (computeUnits * priorityFeeMicroLamports) / 1_000_000,
     );
     return baseFee + priorityFeeLamports + tipLamports;
   }
@@ -438,7 +457,7 @@ export class ClmmSeller {
     tx: Transaction,
     priorityFeeMicroLamports: number,
     computeUnits: number,
-    tipLamports: number
+    tipLamports: number,
   ): Transaction {
     const tipIx = SystemProgram.transfer({
       fromPubkey: this.owner.publicKey,
@@ -454,7 +473,7 @@ export class ClmmSeller {
       ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnits }),
       ComputeBudgetProgram.setComputeUnitPrice({
         microLamports: priorityFeeMicroLamports,
-      })
+      }),
     );
 
     for (const ix of tx.instructions) finalTx.add(ix);
@@ -464,7 +483,7 @@ export class ClmmSeller {
   }
 
   private extractBuiltTransactions(
-    built: any
+    built: any,
   ): Array<Transaction | VersionedTransaction> {
     const out: Array<Transaction | VersionedTransaction> = [];
 
@@ -493,7 +512,7 @@ export class ClmmSeller {
 
   private async sendToSingleFlashBlock(
     url: string,
-    base64Tx: string
+    base64Tx: string,
   ): Promise<string> {
     const payload = {
       jsonrpc: "2.0",
@@ -517,23 +536,29 @@ export class ClmmSeller {
     });
 
     if (resp.status < 200 || resp.status >= 300) {
-      throw new Error(`FlashBlock HTTP ${resp.status}: ${JSON.stringify(resp.data)}`);
+      throw new Error(
+        `FlashBlock HTTP ${resp.status}: ${JSON.stringify(resp.data)}`,
+      );
     }
 
     if (resp.data.error) {
       throw new Error(
-        `FlashBlock error ${resp.data.error.code}: ${resp.data.error.message}` 
+        `FlashBlock error ${resp.data.error.code}: ${resp.data.error.message}`,
       );
     }
 
     if (!resp.data.result) {
-      throw new Error(`FlashBlock returned no signature: ${JSON.stringify(resp.data)}`);
+      throw new Error(
+        `FlashBlock returned no signature: ${JSON.stringify(resp.data)}`,
+      );
     }
 
     return resp.data.result;
   }
 
-  private async sendViaFlashBlock(tx: Transaction | VersionedTransaction): Promise<string> {
+  private async sendViaFlashBlock(
+    tx: Transaction | VersionedTransaction,
+  ): Promise<string> {
     const raw = tx.serialize();
     const base64Tx = Buffer.from(raw).toString("base64");
 
@@ -541,22 +566,12 @@ export class ClmmSeller {
       return this.sendToSingleFlashBlock(this.flashblockUrls[0], base64Tx);
     }
 
-    const attempts = this.flashblockUrls.map((url) =>
-      this.sendToSingleFlashBlock(url, base64Tx)
-    );
-
-    const results = await Promise.allSettled(attempts);
-    const winner = results.find(
-      (r): r is PromiseFulfilledResult<string> => r.status === "fulfilled"
-    );
-
-    if (winner) return winner.value;
-
-    const errors = results
-      .filter((r): r is PromiseRejectedResult => r.status === "rejected")
-      .map((r) => String(r.reason))
-      .join(" | ");
-
-    throw new Error(`All FlashBlock sends failed: ${errors}`);
+    return Promise.any(
+      this.flashblockUrls.map((url) =>
+        this.sendToSingleFlashBlock(url, base64Tx),
+      ),
+    ).catch((err) => {
+      throw new Error(`All FlashBlock sends failed: ${String(err)}`);
+    });
   }
 }
