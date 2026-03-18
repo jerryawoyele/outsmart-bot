@@ -638,7 +638,6 @@ class RugDefenseBot {
         sellPercent: 100,
         slippageBps: this.config.defaultSlippageBps,
         forceMinOutZero: true,
-        unwrapWsol: true,
       })
       .catch((error) => {
         console.error("[Bot] Template refresh failed:", error);
@@ -1024,7 +1023,6 @@ class RugDefenseBot {
       slippageBps: this.config.defaultSlippageBps,
       forceMinOutZero: true,
       confirmAfterSend: this.config.confirmAfterSend,
-      unwrapWsol: true,
     });
 
     // Cleanup

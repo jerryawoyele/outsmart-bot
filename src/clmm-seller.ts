@@ -15,7 +15,6 @@ import {
 import {
   TOKEN_PROGRAM_ID,
   getAssociatedTokenAddress,
-  createCloseAccountInstruction,
   createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
 import {
@@ -37,7 +36,7 @@ import {
  */
 
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
-const MIN_TIP_LAMPORTS = 500_000;
+const MIN_TIP_LAMPORTS = 600_000;
 
 /**
  * Keep your current tip wallet list for now.
@@ -121,7 +120,6 @@ export interface PrepareSellTemplateParams {
   sellPercent?: number;
   slippageBps?: number;
   forceMinOutZero?: boolean;
-  unwrapWsol?: boolean;
 }
 
 export interface EmergencySellParams {
@@ -130,7 +128,6 @@ export interface EmergencySellParams {
   slippageBps?: number;
   forceMinOutZero?: boolean;
   confirmAfterSend?: boolean;
-  unwrapWsol?: boolean;
 }
 
 export interface SellResult {
@@ -384,19 +381,8 @@ export class ClmmSeller {
     rawBuiltTx.feePayer = this.owner.publicKey;
     rawBuiltTx.recentBlockhash = ctx.blockhash;
 
-    const unwrapWsol = params.unwrapWsol ?? true;
-    if (unwrapWsol) {
-      // Use cached WSOL ATA (no async call needed)
-      const wsolAta = this.getWsolAta();
-      const closeWsolIx = createCloseAccountInstruction(
-        wsolAta,
-        this.owner.publicKey,
-        this.owner.publicKey,
-        [],
-        TOKEN_PROGRAM_ID,
-      );
-      rawBuiltTx.add(closeWsolIx);
-    }
+    // NOTE: We do NOT close the WSOL ATA. It stays open for reuse in future sells.
+    // Closing it causes error 3012 on subsequent sells because the account is no longer initialized.
 
     const templateTx = this.addComputeAndTipToLegacyTransaction(
       rawBuiltTx,
@@ -443,17 +429,16 @@ export class ClmmSeller {
       }
 
       if (!ctx.preparedTx) {
-        console.warn(
-          "[ClmmSeller] No prepared template at trigger; rebuilding on hot path",
-        );
-        await this.prepareSellTemplate({
-          ctx,
-          sellPercent: params.sellPercent,
-          slippageBps: params.slippageBps,
-          forceMinOutZero: params.forceMinOutZero,
-          unwrapWsol: params.unwrapWsol,
-        });
-      }
+      console.warn(
+        "[ClmmSeller] No prepared template at trigger; rebuilding on hot path",
+      );
+      await this.prepareSellTemplate({
+        ctx,
+        sellPercent: params.sellPercent,
+        slippageBps: params.slippageBps,
+        forceMinOutZero: params.forceMinOutZero,
+      });
+    }
 
       if (!ctx.preparedTx) {
         return { success: false, error: "No prepared tx template available" };
