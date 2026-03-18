@@ -14,6 +14,7 @@ import {
 } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
@@ -236,6 +237,17 @@ export class ClmmSeller {
     await this.ensureWsolAtaExists();
 
     console.log(`[ClmmSeller] Initialized for ${owner.toBase58()}`);
+  }
+
+  /**
+   * Refresh token accounts in Raydium SDK.
+   * Call this when a new token is detected to update the SDK's token account cache.
+   */
+  async refreshTokenAccounts(): Promise<void> {
+    // Reinitialize Raydium with fresh token accounts
+    this.raydium = null;
+    await this.initialize();
+    console.log(`[ClmmSeller] Refreshed token accounts`);
   }
 
   /**

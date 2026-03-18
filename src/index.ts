@@ -875,6 +875,8 @@ class RugDefenseBot {
 
     // Start monitoring for this position if we have all required data
     if (position.walletTokenAccount && position.poolAddress) {
+      // Refresh Raydium's token accounts so it knows about the new token
+      await this.seller.refreshTokenAccounts();
       await this.startPositionMonitoring(position);
     } else {
       console.warn(
