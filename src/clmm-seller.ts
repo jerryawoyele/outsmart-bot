@@ -497,10 +497,10 @@ export class ClmmSeller {
   ): Promise<string> {
     const payload = {
       jsonrpc: "2.0",
-      id: Date.now().toString(),
+      id: Date.now(),
       method: "sendTransaction",
       params: [
-        base64Tx,
+        [base64Tx],
         {
           encoding: "base64",
           skipPreflight: true,
