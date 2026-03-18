@@ -32,6 +32,7 @@ async function retryWithBackoff<T>(
 export interface PositionTrackerConfig {
   rpcUrl: string;
   walletAddress: string;
+  heliusApiKeys?: string[]; // Available API keys for pool discovery
 }
 
 /**
@@ -43,10 +44,30 @@ export class PositionTracker {
   private walletAddress: string;
   private positions: Map<string, TokenPosition> = new Map(); // tokenMint -> position
   private devWallets: Map<string, DevWallet> = new Map(); // devAddress -> DevWallet
+  private heliusApiKeys: string[] = []; // Available API keys for pool discovery
+  private currentKeyIndex: number = 0; // Current API key index for round-robin
 
   constructor(config: PositionTrackerConfig) {
     this.connection = new Connection(config.rpcUrl, 'processed');
     this.walletAddress = config.walletAddress;
+    this.heliusApiKeys = config.heliusApiKeys || [];
+  }
+
+  /**
+   * Get next available API key (round-robin)
+   */
+  private getNextApiKey(): string | null {
+    if (this.heliusApiKeys.length === 0) return null;
+    const key = this.heliusApiKeys[this.currentKeyIndex];
+    this.currentKeyIndex = (this.currentKeyIndex + 1) % this.heliusApiKeys.length;
+    return key;
+  }
+
+  /**
+   * Check if API keys are available
+   */
+  hasApiKeys(): boolean {
+    return this.heliusApiKeys.length > 0;
   }
 
   /**
@@ -320,11 +341,11 @@ export class PositionTracker {
    */
   async findTokenDev(tokenMint: string): Promise<string | null> {
     try {
-      // Get Helius API key from env
-      const heliusApiKey = process.env.HELIUS_WS_URL?.split('api-key=')[1] || process.env.MAINNET_ENDPOINT?.split('api-key=')[1];
+      // Get next available API key
+      const heliusApiKey = this.getNextApiKey();
       
       if (!heliusApiKey) {
-        console.warn(`[Tracker] No Helius API key found for pool discovery`);
+        console.warn(`[Tracker] No Helius API key available for pool discovery`);
         return null;
       }
 

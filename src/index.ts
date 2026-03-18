@@ -232,6 +232,7 @@ class RugDefenseBot {
     this.positionTracker = new PositionTracker({
       rpcUrl: initialHttpUrl,
       walletAddress: config.walletAddress,
+      heliusApiKeys: config.heliusApiKeys,
     });
 
     this.seller = new ClmmSeller({
@@ -287,9 +288,66 @@ class RugDefenseBot {
     await this.heliusClient.connect();
     this.heliusClient.subscribeToWalletLogs(this.config.walletAddress);
 
-    // Set up monitoring for each position
+    // Set up monitoring for each position with API key assignment
     for (const position of positions) {
-      await this.subscribeToDevTokenAccount(position);
+      // Check if we have capacity for this position
+      if (!this.hasCapacityForNewPosition()) {
+        console.warn(
+          `[Bot] ⚠️ No API keys available for existing position ${position.tokenMint.slice(0, 8)}... - NOT monitoring`,
+        );
+        continue;
+      }
+
+      // Get dev token account to verify CLMM pool
+      const devTokenAccount = await this.heliusClient.getDevTokenAccount(
+        position.devAddress,
+        position.tokenMint,
+      );
+
+      if (!devTokenAccount) {
+        console.log(`[Bot] No CLMM pool for existing position ${position.tokenMint.slice(0, 8)}... - skipping`);
+        continue;
+      }
+
+      // Assign API key to this position
+      const keyIndex = this.assignApiKey(position.tokenMint);
+      if (keyIndex < 0) {
+        console.warn(`[Bot] ⚠️ Failed to assign API key to existing position ${position.tokenMint.slice(0, 8)}...`);
+        continue;
+      }
+
+      position.devTokenAccount = devTokenAccount;
+
+      // Get pool address if not already set
+      if (!position.poolAddress) {
+        const poolAddress = await this.heliusClient.getPoolFromDevTokenAccount(devTokenAccount);
+        if (poolAddress) {
+          position.poolAddress = poolAddress;
+          console.log(`[Bot] Found pool for ${position.tokenMint.slice(0, 8)}...: ${poolAddress.slice(0, 12)}...`);
+        }
+      }
+
+      // Get user token account if not already set
+      if (!position.walletTokenAccount) {
+        const userTokenAccount = await this.heliusClient.getUserTokenAccount(
+          this.config.walletAddress,
+          position.tokenMint,
+        );
+        if (userTokenAccount) {
+          position.walletTokenAccount = userTokenAccount;
+        }
+      }
+
+      // Start monitoring if we have all required data
+      if (position.walletTokenAccount && position.poolAddress) {
+        await this.startPositionMonitoring(position);
+        this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
+      } else {
+        console.warn(
+          `[Bot] Cannot monitor existing position ${position.tokenMint.slice(0, 8)}... - missing data`,
+        );
+        this.releaseApiKey(position.tokenMint);
+      }
     }
 
     // Start polling for new token buys
@@ -731,6 +789,13 @@ class RugDefenseBot {
   ): Promise<void> {
     console.log(`[Bot] Setting up monitoring for: ${tokenMint.slice(0, 8)}...`);
 
+    // First, find dev address using temporary API key (round-robin in tracker)
+    const devAddress = await this.positionTracker.findTokenDev(tokenMint);
+    if (!devAddress) {
+      console.warn(`[Bot] Could not find dev for ${tokenMint.slice(0, 8)}... - skipping`);
+      return;
+    }
+
     // Check if we have capacity for a new position (free plan limit)
     if (!this.hasCapacityForNewPosition()) {
       console.warn(
@@ -742,21 +807,7 @@ class RugDefenseBot {
       return;
     }
 
-    const devAddress = await this.positionTracker.findTokenDev(tokenMint);
-    if (!devAddress) {
-      console.warn(`[Bot] Could not find dev for ${tokenMint.slice(0, 8)}...`);
-      return;
-    }
-
-    // Assign an API key to this position
-    const keyIndex = this.assignApiKey(tokenMint);
-    if (keyIndex < 0) {
-      console.warn(
-        `[Bot] ⚠️ Failed to assign API key to ${tokenMint.slice(0, 8)}... - NOT monitoring`,
-      );
-      return;
-    }
-
+    // Temporarily add position to check for CLMM pool
     await this.positionTracker.addPositionWithDev(
       tokenMint,
       devAddress,
@@ -766,9 +817,77 @@ class RugDefenseBot {
     );
 
     const position = this.positionTracker.getPosition(tokenMint);
-    if (position) {
-      await this.subscribeToDevTokenAccount(position);
+    if (!position) {
+      console.warn(`[Bot] Failed to create position for ${tokenMint.slice(0, 8)}...`);
+      return;
     }
+
+    // Check if this token has a CLMM pool (uses temporary API key from heliusClient)
+    const devTokenAccount = await this.heliusClient.getDevTokenAccount(
+      position.devAddress,
+      position.tokenMint,
+    );
+
+    if (!devTokenAccount) {
+      console.log(`[Bot] No CLMM pool found for ${tokenMint.slice(0, 8)}... - skipping (not a CLMM token)`);
+      this.positionTracker.removePosition(tokenMint);
+      return;
+    }
+
+    // Found CLMM pool - now assign API key permanently
+    const keyIndex = this.assignApiKey(tokenMint);
+    if (keyIndex < 0) {
+      console.warn(
+        `[Bot] ⚠️ Failed to assign API key to ${tokenMint.slice(0, 8)}... - NOT monitoring`,
+      );
+      this.positionTracker.removePosition(tokenMint);
+      return;
+    }
+
+    // Continue with monitoring setup
+    position.devTokenAccount = devTokenAccount;
+
+    // Fetch pool address from dev token account's CLOSE_ACCOUNT transaction
+    const poolAddress = await this.heliusClient.getPoolFromDevTokenAccount(devTokenAccount);
+    if (poolAddress) {
+      position.poolAddress = poolAddress;
+      console.log(
+        `[Bot] Found pool for ${position.tokenMint.slice(0, 8)}...: ${poolAddress.slice(0, 12)}...`,
+      );
+    } else {
+      console.warn(
+        `[Bot] Could not find pool for ${position.tokenMint.slice(0, 8)}... - skipping`,
+      );
+      this.releaseApiKey(tokenMint);
+      this.positionTracker.removePosition(tokenMint);
+      return;
+    }
+
+    // Get user's token account for this mint
+    if (!position.walletTokenAccount) {
+      const userTokenAccount = await this.heliusClient.getUserTokenAccount(
+        this.config.walletAddress,
+        position.tokenMint,
+      );
+      if (userTokenAccount) {
+        position.walletTokenAccount = userTokenAccount;
+      }
+    }
+
+    // Start monitoring for this position if we have all required data
+    if (position.walletTokenAccount && position.poolAddress) {
+      await this.startPositionMonitoring(position);
+    } else {
+      console.warn(
+        `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
+      );
+      this.releaseApiKey(tokenMint);
+      this.positionTracker.removePosition(tokenMint);
+      return;
+    }
+
+    // Subscribe to dev token account for rug detection
+    this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
   }
 
   private async subscribeToDevTokenAccount(
