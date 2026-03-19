@@ -17,6 +17,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
+  createCloseAccountInstruction,
 } from "@solana/spl-token";
 import {
   Raydium,
@@ -37,7 +38,7 @@ import {
  */
 
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
-const MIN_TIP_LAMPORTS = 600_000;
+const MIN_TIP_LAMPORTS = 500_000;
 
 /**
  * Keep your current tip wallet list for now.
@@ -73,6 +74,7 @@ export interface ClmmSellerConfig {
   flashblockApiKey: string;
   flashblockUrl: string;
   flashblockBackupUrl?: string;
+  heliusSenderUrl?: string; // Helius Sender endpoint for parallel broadcast
   commitment?: Commitment;
   defaultSlippageBps?: number;
   priorityFeeMicroLamports?: number;
@@ -158,6 +160,7 @@ export class ClmmSeller {
   private readonly raydiumHttp: ReturnType<typeof axios.create>;
   private readonly flashblockUrls: string[];
   private readonly flashblockApiKey: string;
+  private readonly heliusSenderUrl: string | null;
   private raydium: Awaited<ReturnType<typeof Raydium.load>> | null = null;
   private wsolAta: PublicKey | null = null;
 
@@ -181,6 +184,7 @@ export class ClmmSeller {
     this.flashblockUrls = [config.flashblockUrl, config.flashblockBackupUrl]
       .filter(Boolean)
       .map((u) => u!.replace(/\/+$/, "") + "/");
+    this.heliusSenderUrl = config.heliusSenderUrl || null;
 
     this.raydiumHttp = axios.create({
       timeout: 2000,
@@ -372,7 +376,7 @@ export class ClmmSeller {
       observationId: ctx.computePoolInfo.observationId,
       ownerInfo: {
         feePayer: this.owner.publicKey,
-        useSOLBalance: false,
+        useSOLBalance: true, // Wrap SOL -> WSOL automatically
       },
       remainingAccounts: quote.remainingAccounts,
       txVersion: TxVersion.LEGACY,
@@ -393,8 +397,17 @@ export class ClmmSeller {
     rawBuiltTx.feePayer = this.owner.publicKey;
     rawBuiltTx.recentBlockhash = ctx.blockhash;
 
-    // NOTE: We do NOT close the WSOL ATA. It stays open for reuse in future sells.
-    // Closing it causes error 3012 on subsequent sells because the account is no longer initialized.
+    // Add close WSOL ATA instruction to unwrap WSOL -> SOL at end of tx
+    // The WSOL ATA is created automatically by Raydium SDK when useSOLBalance: true
+    const wsolAta = this.getWsolAta();
+    const closeWsolIx = createCloseAccountInstruction(
+      wsolAta,
+      this.owner.publicKey,
+      this.owner.publicKey,
+      [],
+      TOKEN_PROGRAM_ID,
+    );
+    rawBuiltTx.add(closeWsolIx);
 
     const templateTx = this.addComputeAndTipToLegacyTransaction(
       rawBuiltTx,
@@ -622,22 +635,91 @@ export class ClmmSeller {
     return resp.data.result;
   }
 
+  /**
+   * Send to Helius Sender endpoint.
+   * Helius Sender routes transactions through SWQoS and Jito in parallel.
+   */
+  private async sendToHeliusSender(base64Tx: string): Promise<string> {
+    if (!this.heliusSenderUrl) {
+      throw new Error("Helius Sender URL not configured");
+    }
+
+    const payload = {
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "sendTransaction",
+      params: [
+        base64Tx,
+        {
+          encoding: "base64",
+          skipPreflight: true,
+          maxRetries: 0,
+        },
+      ],
+    };
+
+    const resp = await this.raydiumHttp.post<FlashBlockResp>(
+      this.heliusSenderUrl,
+      payload,
+      {
+        headers: {
+          "Content-Type": "application/json",
+        },
+      },
+    );
+
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(
+        `Helius Sender HTTP ${resp.status}: ${JSON.stringify(resp.data)}`,
+      );
+    }
+
+    if (resp.data.error) {
+      throw new Error(
+        `Helius Sender error ${resp.data.error.code}: ${resp.data.error.message}`,
+      );
+    }
+
+    if (!resp.data.result) {
+      throw new Error(
+        `Helius Sender returned no signature: ${JSON.stringify(resp.data)}`,
+      );
+    }
+
+    return resp.data.result;
+  }
+
+  /**
+   * Multi-endpoint broadcast: sign once, serialize once, fan out to all endpoints.
+   * Uses Promise.any to race FlashBlock primary/backup + Helius Sender.
+   * First successful response wins.
+   */
   private async sendViaFlashBlock(
     tx: Transaction | VersionedTransaction,
   ): Promise<string> {
     const raw = tx.serialize();
     const base64Tx = Buffer.from(raw).toString("base64");
 
-    if (this.flashblockUrls.length === 1) {
-      return this.sendToSingleFlashBlock(this.flashblockUrls[0], base64Tx);
+    // Build list of send promises
+    const sendPromises: Promise<string>[] = [];
+
+    // Add FlashBlock endpoints
+    for (const url of this.flashblockUrls) {
+      sendPromises.push(this.sendToSingleFlashBlock(url, base64Tx));
     }
 
-    return Promise.any(
-      this.flashblockUrls.map((url) =>
-        this.sendToSingleFlashBlock(url, base64Tx),
-      ),
-    ).catch((err) => {
-      throw new Error(`All FlashBlock sends failed: ${String(err)}`);
+    // Add Helius Sender if configured
+    if (this.heliusSenderUrl) {
+      sendPromises.push(this.sendToHeliusSender(base64Tx));
+    }
+
+    if (sendPromises.length === 0) {
+      throw new Error("No send endpoints configured");
+    }
+
+    // Race all endpoints - first success wins
+    return Promise.any(sendPromises).catch((err) => {
+      throw new Error(`All endpoints failed: ${String(err)}`);
     });
   }
 }

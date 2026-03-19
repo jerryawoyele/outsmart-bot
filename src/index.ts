@@ -25,6 +25,7 @@ interface BotConfig {
   flashblockApiKey: string;
   flashblockUrl: string;
   flashblockBackupUrl?: string;
+  heliusSenderUrl?: string; // Helius Sender endpoint for parallel broadcast
 
   defaultSlippageBps?: number;
   priorityFeeMicroLamports?: number;
@@ -209,6 +210,7 @@ class RugDefenseBot {
       stalePoolSnapshotMs: config.stalePoolSnapshotMs ?? 15_000,
       staleTokenBalanceMs: config.staleTokenBalanceMs ?? 90_000,
       flashblockBackupUrl: config.flashblockBackupUrl ?? "",
+      heliusSenderUrl: config.heliusSenderUrl ?? "",
     };
 
     // Build initial HTTP URL with first API key
@@ -241,6 +243,7 @@ class RugDefenseBot {
       flashblockApiKey: config.flashblockApiKey,
       flashblockUrl: config.flashblockUrl,
       flashblockBackupUrl: config.flashblockBackupUrl,
+      heliusSenderUrl: config.heliusSenderUrl,
       defaultSlippageBps: this.config.defaultSlippageBps,
       priorityFeeMicroLamports: this.config.priorityFeeMicroLamports,
       computeUnits: this.config.computeUnits,
@@ -506,8 +509,13 @@ class RugDefenseBot {
 
     const monitored: MonitoredPosition = { ctx };
 
+    // Run initial fetches in parallel to reduce time until position is protected
+    await Promise.all([
+      this.refreshPoolSnapshot(position.poolAddress, monitored),
+      this.refreshTokenBalance(position.walletTokenAccount, monitored),
+    ]);
+
     // Start pool snapshot refresh with jitter to spread requests
-    await this.refreshPoolSnapshot(position.poolAddress, monitored);
     const poolJitter = Math.floor(Math.random() * 1000);
     monitored.poolSnapshotTimer = setInterval(
       () => this.refreshPoolSnapshot(position.poolAddress!, monitored),
@@ -515,7 +523,6 @@ class RugDefenseBot {
     );
 
     // Start token balance polling with jitter
-    await this.refreshTokenBalance(position.walletTokenAccount, monitored);
     const tokenJitter = Math.floor(Math.random() * 2000);
     monitored.tokenBalanceTimer = setInterval(
       () => this.refreshTokenBalance(position.walletTokenAccount!, monitored),
@@ -556,11 +563,11 @@ class RugDefenseBot {
 
       // Also update blockhash and lamports in context
       if (this.blockhashCache) {
-        ctx.blockhash = this.blockhashCache.blockhash;
-        ctx.lastValidBlockHeight = this.blockhashCache.lastValidBlockHeight;
-        ctx.blockhashUpdatedAt = this.blockhashCache.updatedAt;
+        monitored.ctx.blockhash = this.blockhashCache.blockhash;
+        monitored.ctx.lastValidBlockHeight = this.blockhashCache.lastValidBlockHeight;
+        monitored.ctx.blockhashUpdatedAt = this.blockhashCache.updatedAt;
       }
-      ctx.lamportsBalance = this.lamportsBalance;
+      monitored.ctx.lamportsBalance = this.lamportsBalance;
 
       this.maybeRefreshSellTemplate(monitored);
     } catch (error) {
@@ -1118,6 +1125,7 @@ async function main() {
     flashblockApiKey: process.env.FLASHBLOCK_API_KEY!,
     flashblockUrl: process.env.FLASHBLOCK_URL!,
     flashblockBackupUrl: process.env.FLASHBLOCK_BACKUP_URL,
+    heliusSenderUrl: process.env.HELIUS_SENDER_URL,
     defaultSlippageBps: parseInt(process.env.DEFAULT_SLIPPAGE_BPS || "10000"),
     priorityFeeMicroLamports: parseInt(
       process.env.PRIORITY_FEE_MICRO_LAMPORTS || "120000",
