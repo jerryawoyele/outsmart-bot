@@ -256,6 +256,7 @@ export class HeliusWsClient {
               this.fastDetectionSubscriptions.delete(requestId);
               this.fastDetectionSubscriptions.set(subId, fastInfo);
               this.fastDetectionToSubId.set(fastInfo.position.tokenMint, subId);
+              console.log(`[Helius] ✅ Fast-detection subscription confirmed: subId=${subId} for ${fastInfo.position.tokenMint.slice(0, 8)}...`);
               return;
             }
             return;
@@ -264,6 +265,8 @@ export class HeliusWsClient {
           // Handle logs notifications
           if (response.method === 'logsNotification') {
             const subId = response.params?.subscription;
+            console.log(`[Helius] 📨 logsNotification received: subId=${subId}, walletSub=${this.walletLogsSubId}, fastSubs=${this.fastDetectionSubscriptions.size}, devSubs=${this.subscriptions.size}`);
+            
             // Check if this is wallet logs notification
             if (subId === this.walletLogsSubId) {
               const signature = response.params?.result?.value?.signature;
@@ -271,8 +274,10 @@ export class HeliusWsClient {
               this.handleWalletLogsNotification(signature, logs);
             } else if (this.fastDetectionSubscriptions.has(subId)) {
               // Fast-detection account notification - trigger sell immediately
+              console.log(`[Helius] 🎯 Routing to fast-detection handler`);
               this.handleFastDetectionNotification(response);
             } else {
+              console.log(`[Helius] 📌 Routing to dev token account handler`);
               this.handleLogsNotification(response);
             }
           }
