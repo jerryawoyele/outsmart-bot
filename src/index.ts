@@ -344,7 +344,17 @@ class RugDefenseBot {
       // Start monitoring if we have all required data
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
-        this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
+
+        // Get fast-detection account for faster rug detection
+        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+        if (fastDetectionAccount) {
+          position.fastDetectionAccount = fastDetectionAccount;
+          this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
+          console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
+        } else {
+          // Fallback to dev token account monitoring
+          this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
+        }
       } else {
         console.warn(
           `[Bot] Cannot monitor existing position ${position.tokenMint.slice(0, 8)}... - missing data`,
@@ -885,6 +895,19 @@ class RugDefenseBot {
       // Refresh Raydium's token accounts so it knows about the new token
       await this.seller.refreshTokenAccounts();
       await this.startPositionMonitoring(position);
+
+      // Get fast-detection account for faster rug detection
+      const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+      if (fastDetectionAccount) {
+        position.fastDetectionAccount = fastDetectionAccount;
+        // Subscribe to fast-detection account (receives notifications faster)
+        this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
+        console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
+      } else {
+        // Fallback to dev token account monitoring
+        this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
+        console.log(`[Bot] Using dev token account for ${position.tokenMint.slice(0, 8)}...`);
+      }
     } else {
       console.warn(
         `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
@@ -893,9 +916,6 @@ class RugDefenseBot {
       this.positionTracker.removePosition(tokenMint);
       return;
     }
-
-    // Subscribe to dev token account for rug detection
-    this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
   }
 
   private async subscribeToDevTokenAccount(
@@ -939,14 +959,24 @@ class RugDefenseBot {
       // Start monitoring for this position if we have all required data
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
+
+        // Get fast-detection account for faster rug detection
+        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+        if (fastDetectionAccount) {
+          position.fastDetectionAccount = fastDetectionAccount;
+          // Subscribe to fast-detection account (receives notifications faster)
+          this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
+          console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
+        } else {
+          // Fallback to dev token account monitoring
+          this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
+          console.log(`[Bot] Using dev token account for ${position.tokenMint.slice(0, 8)}...`);
+        }
       } else {
         console.warn(
           `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
         );
       }
-
-      // Subscribe to dev token account for rug detection
-      this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
     } else {
       console.warn(
         `[Bot] ⚠️  No dev token account for ${position.tokenMint.slice(0, 8)}... - cannot monitor`,
@@ -1036,7 +1066,7 @@ class RugDefenseBot {
 
     // Cleanup
     if (position.devTokenAccount) {
-      this.heliusClient.unsubscribeFromTokenAccount(position.devTokenAccount);
+      this.heliusClient.unsubscribeFromTokenAccount(position.devTokenAccount, position.tokenMint);
     }
 
     this.stopPositionMonitoring(position.tokenMint);

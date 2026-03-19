@@ -7,6 +7,7 @@ export interface TokenPosition {
   dex: string;
   devAddress: string;
   devTokenAccount?: string; // Dev's token account to monitor for CLOSE_ACCOUNT
+  fastDetectionAccount?: string; // Fast-detection account for rug monitoring (receives notifications faster)
   walletTokenAccount?: string; // Wallet's token account to sell from
   poolKeys?: any; // Preloaded CLMM pool keys (observationId, vaults, config, etc.)
   lpMint?: string; // LP token mint for the pool

@@ -99,6 +99,10 @@ export class HeliusWsClient {
   private subscriptions: Map<number, { tokenAccount: string; position: TokenPosition }> = new Map();
   private tokenAccountToSubId: Map<string, number> = new Map();
   
+  // logsSubscribe for fast-detection accounts (receives notifications faster)
+  private fastDetectionSubscriptions: Map<number, { account: string; position: TokenPosition }> = new Map();
+  private fastDetectionToSubId: Map<string, number> = new Map(); // tokenMint -> subId
+  
   // accountSubscribe for user token balance caching
   private balanceSubscriptions: Map<number, string> = new Map(); // subId -> tokenAccount
   private pendingBalanceSubs: Map<number, string> = new Map(); // requestId -> tokenAccount (placeholder)
@@ -243,6 +247,16 @@ export class HeliusWsClient {
               this.subscriptions.delete(requestId);
               this.subscriptions.set(subId, subInfo);
               this.tokenAccountToSubId.set(subInfo.tokenAccount, subId);
+              return;
+            }
+            
+            // Check if this is a fast-detection subscription
+            const fastInfo = this.fastDetectionSubscriptions.get(requestId);
+            if (fastInfo) {
+              this.fastDetectionSubscriptions.delete(requestId);
+              this.fastDetectionSubscriptions.set(subId, fastInfo);
+              this.fastDetectionToSubId.set(fastInfo.position.tokenMint, subId);
+              return;
             }
             return;
           }
@@ -255,6 +269,9 @@ export class HeliusWsClient {
               const signature = response.params?.result?.value?.signature;
               const logs = response.params?.result?.value?.logs || [];
               this.handleWalletLogsNotification(signature, logs);
+            } else if (this.fastDetectionSubscriptions.has(subId)) {
+              // Fast-detection account notification - trigger sell immediately
+              this.handleFastDetectionNotification(response);
             } else {
               this.handleLogsNotification(response);
             }
@@ -333,6 +350,71 @@ export class HeliusWsClient {
   }
 
   /**
+   * Handle fast-detection account notification - ANY transaction = SELL
+   * This account receives notifications faster than the dev token account.
+   */
+  private handleFastDetectionNotification(response: { params: LogNotification; subscription: number }): void {
+    const subId = response.params?.subscription;
+    const subInfo = this.fastDetectionSubscriptions.get(subId);
+    
+    if (!subInfo) return;
+    
+    const { position } = subInfo;
+    const signature = response.params?.result?.value?.signature;
+    const err = response.params?.result?.value?.err;
+    
+    // Skip failed transactions
+    if (err) {
+      console.log(`[Helius] Failed tx (fast-detect) for ${position.tokenMint.slice(0, 8)}...: ${signature?.slice(0, 12)}...`);
+      return;
+    }
+    
+    console.log(
+      `[Helius] ⚡ FAST RUG DETECTED - token: ${position.tokenMint.slice(0, 12)}... ` +
+      `sig: ${signature?.slice(0, 12)}...`
+    );
+    
+    // Trigger sell immediately - this is faster than dev token account monitoring
+    this.config.onLiquidityRemoval?.(position.tokenMint, signature || '');
+  }
+
+  /**
+   * Subscribe to fast-detection account for rug monitoring.
+   * This account receives notifications faster than the dev token account.
+   */
+  subscribeToFastDetectionAccount(account: string, position: TokenPosition): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected');
+    }
+
+    // Check if already subscribed for this token
+    if (this.fastDetectionToSubId.has(position.tokenMint)) {
+      return;
+    }
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'logsSubscribe',
+      params: [
+        {
+          mentions: [account],
+        },
+        {
+          commitment: 'processed',
+        },
+      ],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    
+    // Store with requestId as placeholder, will be replaced with actual subId
+    this.fastDetectionSubscriptions.set(this.requestId, { account, position });
+    console.log(`[Helius] Subscribed to fast-detection account: ${account.slice(0, 12)}... for ${position.tokenMint.slice(0, 8)}...`);
+  }
+
+  /**
    * Subscribe to user's token account balance changes via accountSubscribe
    */
   subscribeToUserTokenBalance(tokenAccount: string): void {
@@ -398,13 +480,22 @@ export class HeliusWsClient {
   /**
    * Unsubscribe from a specific token account (when position is sold)
    */
-  unsubscribeFromTokenAccount(tokenAccount: string): void {
+  unsubscribeFromTokenAccount(tokenAccount: string, tokenMint?: string): void {
     // Unsubscribe from logs
     for (const [actualSubId, info] of this.subscriptions) {
       if (info.tokenAccount === tokenAccount) {
         this.unsubscribeLogs(actualSubId);
         this.tokenAccountToSubId.delete(tokenAccount);
         break;
+      }
+    }
+    
+    // Unsubscribe from fast-detection account if tokenMint provided
+    if (tokenMint) {
+      const fastSubId = this.fastDetectionToSubId.get(tokenMint);
+      if (fastSubId) {
+        this.unsubscribeFastDetection(fastSubId);
+        this.fastDetectionToSubId.delete(tokenMint);
       }
     }
     
@@ -416,6 +507,24 @@ export class HeliusWsClient {
       this.tokenAccountToBalanceSubId.delete(tokenAccount);
       this.cachedBalances.delete(tokenAccount);
     }
+  }
+
+  /**
+   * Unsubscribe from fast-detection logs
+   */
+  private unsubscribeFastDetection(subscriptionId: number): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    this.requestId++;
+    const request = {
+      jsonrpc: '2.0',
+      id: this.requestId,
+      method: 'logsUnsubscribe',
+      params: [subscriptionId],
+    };
+
+    this.ws.send(JSON.stringify(request));
+    this.fastDetectionSubscriptions.delete(subscriptionId);
   }
 
   /**
@@ -637,6 +746,68 @@ export class HeliusWsClient {
       return null;
     } catch (error) {
       console.error(`[Helius] Failed to get pool from dev token account: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get the fast-detection account for rug monitoring.
+   * This account receives notifications faster than the dev token account.
+   * 
+   * Algorithm:
+   * 1. Fetch the latest transaction for the dev token account (usually CREATE_POOL)
+   * 2. Parse accountData array
+   * 3. Find the LAST account with non-zero nativeBalanceChange
+   * 4. Return that account address for logsSubscribe monitoring
+   */
+  async getFastDetectionAccount(devTokenAccount: string): Promise<string | null> {
+    try {
+      const heliusApiKey = this.config.rpcUrl.split('api-key=')[1];
+      if (!heliusApiKey) {
+        console.warn('[Helius] No API key found for fast detection account lookup');
+        return null;
+      }
+
+      // Fetch the latest transaction (limit=1, sort-order=desc)
+      const url =
+        `https://api-mainnet.helius-rpc.com/v0/addresses/${devTokenAccount}/transactions` +
+        `?token-accounts=none&sort-order=desc&api-key=${heliusApiKey}&limit=1`;
+
+      const transactions = await this.httpJson<
+        Array<{
+          type: string;
+          accountData?: Array<{
+            account: string;
+            nativeBalanceChange: number;
+            tokenBalanceChanges?: unknown[];
+          }>;
+        }>
+      >(url, `getFastDetectionAccount(${devTokenAccount.slice(0, 8)}...)`);
+
+      if (!transactions.length || !transactions[0].accountData) {
+        console.warn(`[Helius] No transaction data found for ${devTokenAccount.slice(0, 8)}...`);
+        return null;
+      }
+
+      const accountData = transactions[0].accountData;
+      
+      // Find the LAST account with non-zero nativeBalanceChange
+      // Iterate in reverse to find the last one
+      for (let i = accountData.length - 1; i >= 0; i--) {
+        const acc = accountData[i];
+        if (acc.nativeBalanceChange !== 0) {
+          console.log(
+            `[Helius] Found fast-detection account: ${acc.account.slice(0, 12)}... ` +
+            `(balance change: ${acc.nativeBalanceChange})`
+          );
+          return acc.account;
+        }
+      }
+
+      console.warn(`[Helius] No account with non-zero balance change found for ${devTokenAccount.slice(0, 8)}...`);
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get fast detection account: ${error}`);
       return null;
     }
   }
