@@ -14,7 +14,7 @@ const PROTO_PATH = path.join(__dirname, '..', 'proto', 'geyser.proto');
 export interface LaserStreamConfig {
   apiKey: string;
   endpoint: string;
-  onTransaction?: (signature: string, accounts: string[]) => void;
+  onTransaction?: (signature: string, filterName: string, tokenMint: string) => void;
   onError?: (error: Error) => void;
   onConnect?: () => void;
 }
@@ -236,20 +236,8 @@ export class LaserStreamClient {
    */
   private handleUpdate(data: any): void {
     try {
-      // Handle pong messages
-      if (data.pong) {
-        console.log('[LaserStream] Received pong');
-        return;
-      }
-
-      // Handle slot updates
-      if (data.slot) {
-        // Slot updates are frequent, only log occasionally
-        return;
-      }
-
-      // Check if this is a transaction update
-      // Structure: { transaction: { transaction: { signature: Buffer, ... }, slot: number } }
+      // Check if this is a transaction update - trigger sell immediately
+      // Structure: { transaction: { transaction: { signature: Buffer, ... }, slot: number }, filters: string[] }
       if (data.transaction) {
         const txWrapper = data.transaction;
         const txInfo = txWrapper.transaction;
@@ -263,26 +251,28 @@ export class LaserStreamClient {
         const signature = txInfo.signature ? this.bufferToBase58(txInfo.signature) : 'unknown';
         const slot = txWrapper.slot || 0;
 
-        // Get the filters that matched
+        // Get the filter that matched (tells us which position)
         const filters = data.filters || [];
 
         console.log(
-          `[LaserStream] TX detected - slot: ${slot} sig: ${signature.slice(0, 12)}... filters: ${filters.join(',')}`
+          `[LaserStream] ⚡ TX DETECTED - slot: ${slot} sig: ${signature.slice(0, 12)}... filters: ${filters.join(',')}`
         );
 
-        // Find which monitored accounts are involved via the filter name
+        // Find the position that matched and trigger sell
         for (const filterName of filters) {
-          const tokenMint = this.subscriptions.get(filterName)?.position.tokenMint;
-          if (tokenMint) {
+          const subscription = this.subscriptions.get(filterName);
+          if (subscription) {
+            const tokenMint = subscription.position.tokenMint;
             console.log(
-              `[LaserStream] ⚡ RUG DETECTED - token: ${tokenMint.slice(0, 12)}... ` +
-              `sig: ${signature.slice(0, 12)}...`
+              `[LaserStream] ⚡ RUG DETECTED - token: ${tokenMint.slice(0, 12)}... - TRIGGERING SELL`
             );
             
-            // Trigger the callback with the monitored accounts
-            const monitoredAccounts = Array.from(this.monitoredAccounts.keys());
-            this.config.onTransaction?.(signature, monitoredAccounts);
-            return;
+            // Trigger the callback with the specific token mint
+            this.config.onTransaction?.(signature, filterName, tokenMint);
+            
+            // Remove this position from monitoring after detection
+            this.removePosition(tokenMint);
+            return; // Only handle one match
           }
         }
       }

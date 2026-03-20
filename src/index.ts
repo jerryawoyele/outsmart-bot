@@ -265,16 +265,11 @@ class RugDefenseBot {
       this.laserStreamClient = new LaserStreamClient({
         apiKey: this.config.laserstreamApiKey,
         endpoint: this.config.laserstreamEndpoint,
-        onTransaction: (signature: string, accounts: string[]) => {
-          // Find which position this transaction affects
-          for (const account of accounts) {
-            const tokenMint = this.findTokenMintByAccount(account);
-            if (tokenMint) {
-              console.log(`[LaserStream] Triggering sell for ${tokenMint.slice(0, 12)}...`);
-              this.handleLiquidityRemoval(tokenMint, signature);
-              return;
-            }
-          }
+        onTransaction: (signature: string, filterName: string, tokenMint: string) => {
+          // Sell the specific position that was detected
+          console.log(`[LaserStream] Triggering sell for ${tokenMint.slice(0, 12)}...`);
+          this.handleLiquidityRemoval(tokenMint, signature);
+          // Position is already removed from monitoring in LaserStreamClient
         },
         onError: (error: Error) => {
           console.error("[LaserStream] Error:", error.message);
