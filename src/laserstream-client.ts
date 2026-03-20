@@ -1,15 +1,5 @@
-import * as grpc from '@grpc/grpc-js';
-import * as protoLoader from '@grpc/proto-loader';
-import * as path from 'path';
-import { fileURLToPath } from 'url';
+import { subscribe, CommitmentLevel, LaserstreamConfig, SubscribeRequest, StreamHandle } from 'helius-laserstream';
 import { TokenPosition } from './types.js';
-
-// Get __dirname equivalent for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Yellowstone gRPC proto definitions
-const PROTO_PATH = path.join(__dirname, '..', 'proto', 'geyser.proto');
 
 export interface LaserStreamConfig {
   apiKey: string;
@@ -26,21 +16,14 @@ export interface LaserStreamSubscription {
 
 /**
  * LaserStream gRPC client for fast rug detection.
- * Uses Helius' Yellowstone-based gRPC streaming service.
+ * Uses the official helius-laserstream npm package.
  */
 export class LaserStreamClient {
   private config: LaserStreamConfig;
-  private client: grpc.Client | null = null;
-  private stream: grpc.ClientDuplexStream<any, any> | null = null;
   private subscriptions: Map<string, LaserStreamSubscription> = new Map(); // tokenMint -> subscription
   private monitoredAccounts: Map<string, string> = new Map(); // account -> tokenMint
   private isRunning = false;
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
-  private reconnectDelay = 1000;
-  private pendingRestart = false;
-  private keepaliveInterval: NodeJS.Timeout | null = null;
-  private pingId = 0;
+  private streamHandle: StreamHandle | null = null;
 
   constructor(config: LaserStreamConfig) {
     this.config = config;
@@ -72,14 +55,9 @@ export class LaserStreamClient {
       `accounts: ${fastDetectionAccount.slice(0, 8)}..., ${devTokenAccount.slice(0, 8)}...`
     );
 
-    // If stream is active, just write an updated request (don't restart)
-    if (this.isRunning && this.stream && typeof this.stream.write === 'function') {
-      this.writeSubscriptionRequest();
-    } else if (this.isRunning) {
-      // No active stream, start one
-      this.startSubscription().catch(err => {
-        console.error('[LaserStream] Failed to start subscription:', err);
-      });
+    // If already running, restart with new subscription
+    if (this.isRunning) {
+      this.restartSubscription();
     }
   }
 
@@ -94,7 +72,7 @@ export class LaserStreamClient {
       }
       this.subscriptions.delete(tokenMint);
       
-      if (this.isRunning) {
+      if (this.isRunning && this.subscriptions.size > 0) {
         this.restartSubscription();
       }
     }
@@ -104,85 +82,14 @@ export class LaserStreamClient {
    * Connect to LaserStream and start monitoring.
    */
   async connect(): Promise<void> {
-    try {
-      // Create gRPC client - load proto definition
-      const packageDefinition = await protoLoader.load(PROTO_PATH, {
-        keepCase: false, // Use camelCase for generated client
-        longs: String,
-        enums: String,
-        defaults: true,
-        oneofs: true,
-      });
-
-      const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-      const Geyser = (protoDescriptor as any).geyser.Geyser;
-
-      // Create client with API key in metadata
-      const metadata = new grpc.Metadata();
-      metadata.add('x-token', this.config.apiKey);
-
-      this.client = new Geyser(
-        this.config.endpoint,
-        grpc.credentials.createSsl(),
-        { 'grpc.max_receive_message_length': 1024 * 1024 * 16 } // 16MB max message
-      );
-
-      console.log(`[LaserStream] Connected to ${this.config.endpoint}`);
-      this.reconnectAttempts = 0;
-      this.config.onConnect?.();
-
-    } catch (error) {
-      console.error('[LaserStream] Connection failed:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Write subscription request to the stream (for updating filters without restart).
-   */
-  private writeSubscriptionRequest(): void {
-    if (!this.stream || typeof this.stream.write !== 'function') {
-      return;
-    }
-
-    const accounts = Array.from(this.monitoredAccounts.keys());
-    
-    // Build transactions filter with each token mint as a separate filter name
-    const transactionsFilter: Record<string, any> = {};
-    for (const [tokenMint, sub] of this.subscriptions) {
-      transactionsFilter[tokenMint] = {
-        vote: false,
-        failed: false,
-        accountInclude: sub.accounts,
-        accountExclude: [],
-        accountRequired: [],
-      };
-    }
-
-    const request = {
-      accounts: {},
-      slots: {},
-      transactions: transactionsFilter,
-      transactionsStatus: {},
-      blocks: {},
-      blocksMeta: {},
-      entry: {},
-      accountsDataSlice: [],
-      commitment: 0, // PROCESSED
-    };
-
-    this.stream.write(request);
-    console.log(`[LaserStream] Updated subscription for ${this.subscriptions.size} positions (${accounts.length} accounts)`);
+    console.log(`[LaserStream] Connected to ${this.config.endpoint}`);
+    this.config.onConnect?.();
   }
 
   /**
    * Start the subscription stream.
    */
   async start(): Promise<void> {
-    if (!this.client) {
-      await this.connect();
-    }
-
     if (this.monitoredAccounts.size === 0) {
       console.log('[LaserStream] No accounts to monitor yet - will subscribe when positions added');
       this.isRunning = true;
@@ -197,75 +104,79 @@ export class LaserStreamClient {
    * Start or restart the gRPC subscription with current accounts.
    */
   private async startSubscription(): Promise<void> {
-    if (!this.client) {
-      console.error('[LaserStream] No client connection');
+    if (this.subscriptions.size === 0) {
+      console.log('[LaserStream] No subscriptions to monitor');
       return;
     }
 
     const accounts = Array.from(this.monitoredAccounts.keys());
     console.log(`[LaserStream] Starting subscription for ${accounts.length} accounts`);
 
+    // Build transactions filter with each token mint as a separate filter name
+    const transactionsFilter: Record<string, any> = {};
+    for (const [tokenMint, sub] of this.subscriptions) {
+      transactionsFilter[tokenMint] = {
+        vote: false,
+        failed: false,
+        accountInclude: sub.accounts,
+        accountExclude: [],
+        accountRequired: [],
+      };
+    }
+
+    const subscriptionRequest: SubscribeRequest = {
+      transactions: transactionsFilter,
+      commitment: CommitmentLevel.PROCESSED,
+      accounts: {},
+      slots: {},
+      transactionsStatus: {},
+      blocks: {},
+      blocksMeta: {},
+      entry: {},
+      accountsDataSlice: [],
+    };
+
+    const laserstreamConfig: LaserstreamConfig = {
+      apiKey: this.config.apiKey,
+      endpoint: this.config.endpoint,
+    };
+
     try {
-      const metadata = new grpc.Metadata();
-      metadata.add('x-token', this.config.apiKey);
-
-      // Create bidirectional stream
-      const stream = (this.client as any).subscribe(metadata);
-      this.stream = stream;
-
-      stream.on('data', (data: any) => {
-        this.handleUpdate(data);
-      });
-
-      stream.on('error', (error: Error) => {
-        console.error('[LaserStream] Stream error:', error.message);
-        this.config.onError?.(error);
-      });
-
-      stream.on('end', () => {
-        console.log('[LaserStream] Stream ended');
-        this.stopKeepalive();
-        if (this.isRunning && !this.pendingRestart) {
-          this.attemptReconnect();
+      this.streamHandle = await subscribe(
+        laserstreamConfig,
+        subscriptionRequest,
+        (data: any) => this.handleUpdate(data),
+        (error: Error) => {
+          console.error('[LaserStream] Stream error:', error.message);
+          this.config.onError?.(error);
         }
-      });
+      );
 
-      // Send initial subscription request
-      this.writeSubscriptionRequest();
-
-      // Start keepalive ping (every 30 seconds to prevent 10-min timeout)
-      this.startKeepalive();
-
+      console.log(`[LaserStream] Updated subscription for ${this.subscriptions.size} positions (${accounts.length} accounts)`);
     } catch (error) {
       console.error('[LaserStream] Failed to start subscription:', error);
-      this.attemptReconnect();
+      this.config.onError?.(error as Error);
     }
   }
 
   /**
-   * Start keepalive ping interval.
+   * Restart subscription with current accounts.
    */
-  private startKeepalive(): void {
-    this.stopKeepalive(); // Clear any existing interval
-    
-    this.keepaliveInterval = setInterval(() => {
-      if (this.stream && typeof this.stream.write === 'function') {
-        this.pingId++;
-        this.stream.write({
-          ping: { id: this.pingId },
+  private restartSubscription(): void {
+    // Cancel current stream
+    if (this.streamHandle) {
+      this.streamHandle.cancel();
+      this.streamHandle = null;
+    }
+
+    // Small delay to allow cleanup, then restart
+    setTimeout(() => {
+      if (this.isRunning && this.subscriptions.size > 0) {
+        this.startSubscription().catch(err => {
+          console.error('[LaserStream] Failed to restart subscription:', err);
         });
       }
-    }, 30000); // Ping every 30 seconds
-  }
-
-  /**
-   * Stop keepalive ping interval.
-   */
-  private stopKeepalive(): void {
-    if (this.keepaliveInterval) {
-      clearInterval(this.keepaliveInterval);
-      this.keepaliveInterval = null;
-    }
+    }, 100);
   }
 
   /**
@@ -274,19 +185,10 @@ export class LaserStreamClient {
   private handleUpdate(data: any): void {
     try {
       // Check if this is a transaction update - trigger sell immediately
-      // Structure: { transaction: { transaction: { signature: Buffer, ... }, slot: number }, filters: string[] }
       if (data.transaction) {
-        const txWrapper = data.transaction;
-        const txInfo = txWrapper.transaction;
-        
-        if (!txInfo) return;
-
-        // Skip vote transactions
-        if (txInfo.isVote) return;
-
-        // Signature is a Buffer, convert to base58
-        const signature = txInfo.signature ? this.bufferToBase58(txInfo.signature) : 'unknown';
-        const slot = txWrapper.slot || 0;
+        const tx = data.transaction;
+        const signature = tx.signature || 'unknown';
+        const slot = tx.slot || 0;
 
         // Get the filter that matched (tells us which position)
         const filters = data.filters || [];
@@ -319,88 +221,12 @@ export class LaserStreamClient {
   }
 
   /**
-   * Convert Buffer to base58 string.
-   */
-  private bufferToBase58(buf: Buffer | Uint8Array): string {
-    const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-    const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-    
-    let num = BigInt('0x' + bytes.toString('hex'));
-    let result = '';
-    
-    while (num > 0n) {
-      const remainder = Number(num % 58n);
-      result = ALPHABET[remainder] + result;
-      num = num / 58n;
-    }
-    
-    // Add leading zeros
-    for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
-      result = '1' + result;
-    }
-    
-    return result;
-  }
-
-  /**
-   * Restart subscription with current accounts.
-   */
-  private restartSubscription(): void {
-    if (this.pendingRestart) return; // Already pending restart
-    this.pendingRestart = true;
-
-    // Cancel current stream
-    if (this.stream) {
-      this.stream.cancel();
-      this.stream = null;
-    }
-
-    // Small delay to allow cleanup, then restart
-    setTimeout(() => {
-      this.pendingRestart = false;
-      if (this.isRunning && this.monitoredAccounts.size > 0) {
-        this.startSubscription().catch(err => {
-          console.error('[LaserStream] Failed to restart subscription:', err);
-        });
-      }
-    }, 100);
-  }
-
-  /**
-   * Attempt to reconnect with exponential backoff.
-   */
-  private async attemptReconnect(): Promise<void> {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('[LaserStream] Max reconnect attempts reached');
-      return;
-    }
-
-    this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-
-    console.log(`[LaserStream] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
-    await new Promise((resolve) => setTimeout(resolve, delay));
-
-    try {
-      await this.start();
-    } catch (err) {
-      console.error('[LaserStream] Reconnect failed:', err);
-    }
-  }
-
-  /**
    * Disconnect from LaserStream.
    */
   disconnect(): void {
-    this.stopKeepalive();
-    if (this.stream) {
-      this.stream.cancel();
-      this.stream = null;
-    }
-    if (this.client) {
-      this.client.close();
-      this.client = null;
+    if (this.streamHandle) {
+      this.streamHandle.cancel();
+      this.streamHandle = null;
     }
     this.isRunning = false;
     console.log('[LaserStream] Disconnected');
