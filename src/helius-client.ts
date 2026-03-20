@@ -272,23 +272,19 @@ export class HeliusWsClient {
               const signature = response.params?.result?.value?.signature;
               const logs = response.params?.result?.value?.logs || [];
               this.handleWalletLogsNotification(signature, logs);
+            } else if (this.fastDetectionSubscriptions.has(subId)) {
+              // Fast-detection logs notification - trigger sell immediately
+              console.log(`[Helius] ⚡ FAST RUG DETECTED via logsSubscribe: subId=${subId}`);
+              this.handleFastDetectionNotification(response);
             } else {
               console.log(`[Helius] 📌 Routing to dev token account handler`);
               this.handleLogsNotification(response);
             }
           }
           
-          // Handle account notifications (for balance caching AND fast-detection)
+          // Handle account notifications (for balance caching only)
           if (response.method === 'accountNotification') {
-            const subId = response.params?.subscription;
-            
-            // Check if this is a fast-detection account notification
-            if (this.fastDetectionSubscriptions.has(subId)) {
-              console.log(`[Helius] ⚡ FAST RUG DETECTED via accountSubscribe: subId=${subId}`);
-              this.handleFastDetectionAccountNotification(response);
-            } else {
-              this.handleAccountNotification(response);
-            }
+            this.handleAccountNotification(response);
           }
         } catch (err) {
           console.error('[Helius] Failed to parse message:', err);
@@ -359,33 +355,38 @@ export class HeliusWsClient {
   }
 
   /**
-   * Handle fast-detection account notification via accountSubscribe.
-   * ANY change to the account (lamports or data) = SELL immediately.
-   * This is faster than logsSubscribe because it doesn't wait for logs to be generated.
+   * Handle fast-detection logs notification - ANY log = SELL immediately.
+   * This is the fastest way to detect rug pulls.
    */
-  private handleFastDetectionAccountNotification(response: { params: AccountNotification; subscription: number }): void {
+  private handleFastDetectionNotification(response: { params: LogNotification; subscription: number }): void {
     const subId = response.params?.subscription;
     const subInfo = this.fastDetectionSubscriptions.get(subId);
     
     if (!subInfo) return;
     
-    const { position, account } = subInfo;
-    const lamports = response.params?.result?.value?.lamports;
+    const { position } = subInfo;
+    const signature = response.params?.result?.value?.signature;
+    const err = response.params?.result?.value?.err;
+    
+    // Skip failed transactions
+    if (err) {
+      console.log(`[Helius] Failed tx (fast-detect) for ${position.tokenMint.slice(0, 8)}...: ${signature?.slice(0, 12)}...`);
+      return;
+    }
     
     console.log(
       `[Helius] ⚡ FAST RUG DETECTED - token: ${position.tokenMint.slice(0, 12)}... ` +
-      `account: ${account.slice(0, 12)}... lamports: ${lamports}`
+      `sig: ${signature?.slice(0, 12)}...`
     );
     
-    // Trigger sell immediately - account change detected
-    // We don't have a signature from accountSubscribe, use empty string
-    this.config.onLiquidityRemoval?.(position.tokenMint, '');
+    // Trigger sell immediately - any log mentioning the account = rug
+    this.config.onLiquidityRemoval?.(position.tokenMint, signature || '');
   }
 
   /**
    * Subscribe to fast-detection account for rug monitoring.
-   * Uses accountSubscribe to detect ANY change to the account (lamports or data).
-   * This is more reliable than logsSubscribe which only catches accounts mentioned in logs.
+   * Uses logsSubscribe to detect ANY transaction mentioning the account.
+   * When any log is detected, sell immediately.
    */
   subscribeToFastDetectionAccount(account: string, position: TokenPosition): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -401,11 +402,12 @@ export class HeliusWsClient {
     const request = {
       jsonrpc: '2.0',
       id: this.requestId,
-      method: 'accountSubscribe',
+      method: 'logsSubscribe',
       params: [
-        account,
         {
-          encoding: 'base64',
+          mentions: [account],
+        },
+        {
           commitment: 'processed',
         },
       ],
@@ -415,7 +417,7 @@ export class HeliusWsClient {
     
     // Store with requestId as placeholder, will be replaced with actual subId
     this.fastDetectionSubscriptions.set(this.requestId, { account, position });
-    console.log(`[Helius] Subscribed to fast-detection account: ${account.slice(0, 12)}... for ${position.tokenMint.slice(0, 8)}...`);
+    console.log(`[Helius] Subscribed to fast-detection logs: ${account.slice(0, 12)}... for ${position.tokenMint.slice(0, 8)}...`);
   }
 
   /**
@@ -514,7 +516,7 @@ export class HeliusWsClient {
   }
 
   /**
-   * Unsubscribe from fast-detection account subscription
+   * Unsubscribe from fast-detection logs subscription
    */
   private unsubscribeFastDetection(subscriptionId: number): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
@@ -523,7 +525,7 @@ export class HeliusWsClient {
     const request = {
       jsonrpc: '2.0',
       id: this.requestId,
-      method: 'accountUnsubscribe',
+      method: 'logsUnsubscribe',
       params: [subscriptionId],
     };
 
