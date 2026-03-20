@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Yellowstone gRPC proto definitions
-const PROTO_PATH = path.join(__dirname, '..', 'proto', 'yellowstone.proto');
+const PROTO_PATH = path.join(__dirname, '..', 'proto', 'geyser.proto');
 
 export interface LaserStreamConfig {
   apiKey: string;
@@ -31,7 +31,7 @@ export interface LaserStreamSubscription {
 export class LaserStreamClient {
   private config: LaserStreamConfig;
   private client: grpc.Client | null = null;
-  private stream: grpc.ClientReadableStream<any> | null = null;
+  private stream: grpc.ClientDuplexStream<any, any> | null = null;
   private subscriptions: Map<string, LaserStreamSubscription> = new Map(); // tokenMint -> subscription
   private monitoredAccounts: Map<string, string> = new Map(); // account -> tokenMint
   private isRunning = false;
@@ -70,9 +70,14 @@ export class LaserStreamClient {
       `accounts: ${fastDetectionAccount.slice(0, 8)}..., ${devTokenAccount.slice(0, 8)}...`
     );
 
-    // If already running, restart subscription to include new accounts
-    if (this.isRunning) {
-      this.restartSubscription();
+    // If stream is active, just write an updated request (don't restart)
+    if (this.isRunning && this.stream && typeof this.stream.write === 'function') {
+      this.writeSubscriptionRequest();
+    } else if (this.isRunning) {
+      // No active stream, start one
+      this.startSubscription().catch(err => {
+        console.error('[LaserStream] Failed to start subscription:', err);
+      });
     }
   }
 
@@ -100,7 +105,7 @@ export class LaserStreamClient {
     try {
       // Create gRPC client - load proto definition
       const packageDefinition = await protoLoader.load(PROTO_PATH, {
-        keepCase: false,
+        keepCase: false, // Use camelCase for generated client
         longs: String,
         enums: String,
         defaults: true,
@@ -108,13 +113,13 @@ export class LaserStreamClient {
       });
 
       const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-      const Yellowstone = (protoDescriptor as any).yellowstone.Yellowstone;
+      const Geyser = (protoDescriptor as any).geyser.Geyser;
 
       // Create client with API key in metadata
       const metadata = new grpc.Metadata();
       metadata.add('x-token', this.config.apiKey);
 
-      this.client = new Yellowstone(
+      this.client = new Geyser(
         this.config.endpoint,
         grpc.credentials.createSsl(),
         { 'grpc.max_receive_message_length': 1024 * 1024 * 16 } // 16MB max message
@@ -128,6 +133,39 @@ export class LaserStreamClient {
       console.error('[LaserStream] Connection failed:', error);
       throw error;
     }
+  }
+
+  /**
+   * Write subscription request to the stream (for updating filters without restart).
+   */
+  private writeSubscriptionRequest(): void {
+    if (!this.stream || typeof this.stream.write !== 'function') {
+      return;
+    }
+
+    const accounts = Array.from(this.monitoredAccounts.keys());
+    const request = {
+      accounts: {},
+      slots: {},
+      transactions: {
+        rugWatch: {
+          vote: false,
+          failed: false,
+          accountInclude: accounts,
+          accountExclude: [],
+          accountRequired: [],
+        },
+      },
+      transactionsStatus: {},
+      blocks: {},
+      blocksMeta: {},
+      entry: {},
+      accountsDataSlice: [],
+      commitment: 0, // PROCESSED
+    };
+
+    this.stream.write(request);
+    console.log(`[LaserStream] Updated subscription for ${accounts.length} accounts`);
   }
 
   /**
@@ -157,38 +195,15 @@ export class LaserStreamClient {
       return;
     }
 
-    // Build subscription request
     const accounts = Array.from(this.monitoredAccounts.keys());
-    
-    const request = {
-      transactions: {
-        rugWatch: {
-          accountInclude: accounts,
-          accountExclude: [],
-          accountRequired: [],
-          vote: false,
-          failed: false,
-        },
-      },
-      commitment: 'processed',
-      accounts: {},
-      accountsDataSlice: [],
-      slots: {},
-      transactionsStatus: {},
-      blocks: {},
-      blocksMeta: {},
-      entry: {},
-    };
-
     console.log(`[LaserStream] Starting subscription for ${accounts.length} accounts`);
 
     try {
-      // Create metadata with API key
       const metadata = new grpc.Metadata();
       metadata.add('x-token', this.config.apiKey);
 
-      // Call the Subscribe method
-      const stream = (this.client as any).subscribe(request, metadata);
+      // Create bidirectional stream
+      const stream = (this.client as any).subscribe(metadata);
       this.stream = stream;
 
       stream.on('data', (data: any) => {
@@ -198,16 +213,17 @@ export class LaserStreamClient {
       stream.on('error', (error: Error) => {
         console.error('[LaserStream] Stream error:', error.message);
         this.config.onError?.(error);
-        // Don't auto-reconnect on error - let the 'end' event handle it
       });
 
       stream.on('end', () => {
         console.log('[LaserStream] Stream ended');
-        // Only attempt reconnect if we're still supposed to be running
         if (this.isRunning && !this.pendingRestart) {
           this.attemptReconnect();
         }
       });
+
+      // Send initial subscription request
+      this.writeSubscriptionRequest();
 
     } catch (error) {
       console.error('[LaserStream] Failed to start subscription:', error);

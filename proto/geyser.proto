@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package geyser;
+
+option go_package = "github.com/rpcpool/yellowstone-grpc/examples/golang/proto";
+
+service Geyser {
+  rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeUpdate) {}
+  rpc Ping(PingRequest) returns (PongResponse) {}
+}
+
+enum CommitmentLevel {
+  PROCESSED = 0;
+  CONFIRMED = 1;
+  FINALIZED = 2;
+}
+
+message SubscribeRequest {
+  map<string, SubscribeRequestFilterAccounts> accounts = 1;
+  map<string, SubscribeRequestFilterSlots> slots = 2;
+  map<string, SubscribeRequestFilterTransactions> transactions = 3;
+  map<string, SubscribeRequestFilterTransactions> transactions_status = 10;
+  map<string, SubscribeRequestFilterBlocks> blocks = 4;
+  map<string, SubscribeRequestFilterBlocksMeta> blocks_meta = 5;
+  map<string, SubscribeRequestFilterEntry> entry = 8;
+  optional CommitmentLevel commitment = 6;
+  repeated SubscribeRequestAccountsDataSlice accounts_data_slice = 7;
+  optional SubscribeRequestPing ping = 9;
+}
+
+message SubscribeRequestFilterAccounts {
+  repeated string account = 2;
+  repeated string owner = 3;
+}
+
+message SubscribeRequestFilterSlots {
+  optional bool filter_by_commitment = 1;
+}
+
+message SubscribeRequestFilterTransactions {
+  optional bool vote = 1;
+  optional bool failed = 2;
+  optional string signature = 5;
+  repeated string account_include = 3;
+  repeated string account_exclude = 4;
+  repeated string account_required = 6;
+}
+
+message SubscribeRequestFilterBlocks {
+  repeated string account_include = 1;
+}
+
+message SubscribeRequestFilterBlocksMeta {}
+
+message SubscribeRequestFilterEntry {}
+
+message SubscribeRequestAccountsDataSlice {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
+message SubscribeRequestPing {
+  int32 id = 1;
+}
+
+message PingRequest {
+  int32 id = 1;
+}
+
+message PongResponse {
+  int32 id = 1;
+}
+
+message SubscribeUpdate {
+  oneof update_oneof {
+    SubscribeUpdateAccount account = 1;
+    SubscribeUpdateTransaction transaction = 3;
+    SubscribeUpdateSlot slot = 7;
+    SubscribeUpdatePong pong = 10;
+  }
+  repeated string filters = 9;
+}
+
+message SubscribeUpdateAccount {
+  string account = 1;
+  string owner = 2;
+  bytes data = 3;
+  uint64 lamports = 4;
+  bool executable = 5;
+  uint64 rent_epoch = 6;
+  bool is_writable = 7;
+  uint64 slot = 8;
+}
+
+message SubscribeUpdateTransaction {
+  repeated string signatures = 1;
+  bool is_vote = 2;
+  bytes transaction = 3;
+  bytes meta = 4;
+  uint64 slot = 5;
+  int64 block_time = 6;
+}
+
+message SubscribeUpdateSlot {
+  uint64 slot = 1;
+  bool is_parent = 2;
+  string status = 3;
+}
+
+message SubscribeUpdatePong {
+  int32 id = 1;
+}
