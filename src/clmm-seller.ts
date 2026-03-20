@@ -25,6 +25,7 @@ import {
   parseTokenAccountResp,
   PoolUtils,
 } from "@raydium-io/raydium-sdk-v2";
+import { rpcRateLimiter } from "./rpc-rate-limiter.js";
 
 /**
  * Near-prebuilt CLMM seller.
@@ -209,6 +210,7 @@ export class ClmmSeller {
     if (this.raydium) return;
 
     const owner = this.owner.publicKey;
+    await rpcRateLimiter.waitForSlot();
     const tokenAccountResp = await this.connection.getTokenAccountsByOwner(
       owner,
       {
@@ -272,6 +274,7 @@ export class ClmmSeller {
   private async ensureWsolAtaExists(): Promise<void> {
     if (!this.wsolAta) return;
 
+    await rpcRateLimiter.waitForSlot();
     const accountInfo = await this.connection.getAccountInfo(this.wsolAta);
     if (accountInfo) {
       console.log(`[ClmmSeller] WSOL ATA exists: ${this.wsolAta.toBase58().slice(0, 12)}...`);
@@ -290,6 +293,7 @@ export class ClmmSeller {
       TOKEN_PROGRAM_ID
     );
 
+    await rpcRateLimiter.waitForSlot();
     const { blockhash, lastValidBlockHeight } =
       await this.connection.getLatestBlockhash('processed');
 

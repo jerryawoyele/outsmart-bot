@@ -8,6 +8,7 @@ import { LaserStreamClient } from "./laserstream-client.js";
 import { PositionTracker } from "./position-tracker.js";
 import { ClmmSeller, PrecomputedSellContext } from "./clmm-seller.js";
 import { TokenPosition } from "./types.js";
+import { rpcRateLimiter } from "./rpc-rate-limiter.js";
 
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
 
@@ -427,6 +428,7 @@ class RugDefenseBot {
 
     const owner = new PublicKey(this.config.walletAddress);
 
+    await rpcRateLimiter.waitForSlot();
     const tokenAccountResp = await this.connection.getTokenAccountsByOwner(
       owner,
       {
@@ -434,6 +436,7 @@ class RugDefenseBot {
       },
     );
 
+    await rpcRateLimiter.waitForSlot();
     const token2022Resp = await this.connection.getTokenAccountsByOwner(owner, {
       programId: TOKEN_2022_PROGRAM_ID,
     });
@@ -472,6 +475,7 @@ class RugDefenseBot {
   private async startBlockhashLoop(): Promise<void> {
     const refresh = async () => {
       try {
+        await rpcRateLimiter.waitForSlot();
         const latest = await this.connection.getLatestBlockhash(
           this.config.commitment,
         );
@@ -495,6 +499,7 @@ class RugDefenseBot {
   private async startLamportsBalanceLoop(): Promise<void> {
     const refresh = async () => {
       try {
+        await rpcRateLimiter.waitForSlot();
         this.lamportsBalance = await this.connection.getBalance(
           new PublicKey(this.config.walletAddress),
           this.config.commitment,

@@ -1,6 +1,7 @@
 import { TokenPosition, DevWallet, RAYDIUM_CLMM_PROGRAM_ID } from './types.js';
 import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { rpcRateLimiter } from './rpc-rate-limiter.js';
 
 /**
  * Retry a function with exponential backoff
@@ -184,6 +185,8 @@ export class PositionTracker {
   private async fetchPoolCreator(poolAddress: string): Promise<string> {
     try {
       const pubkey = new PublicKey(poolAddress);
+      
+      await rpcRateLimiter.waitForSlot();
       const accountInfo = await this.connection.getAccountInfo(pubkey);
 
       if (!accountInfo) {
@@ -191,6 +194,7 @@ export class PositionTracker {
       }
 
       // For Raydium CLMM, fetch pool creation transaction to find creator
+      await rpcRateLimiter.waitForSlot();
       const signatures = await this.connection.getSignaturesForAddress(pubkey, {
         limit: 1,
       });
@@ -200,6 +204,7 @@ export class PositionTracker {
       }
 
       // Get the first transaction (pool creation)
+      await rpcRateLimiter.waitForSlot();
       const tx = await this.connection.getParsedTransaction(signatures[0].signature, {
         maxSupportedTransactionVersion: 0,
       });
@@ -239,6 +244,7 @@ export class PositionTracker {
 
       // Query pool state for liquidity info
       const pubkey = new PublicKey(poolAddress);
+      await rpcRateLimiter.waitForSlot();
       const accountInfo = await this.connection.getAccountInfo(pubkey);
 
       // Basic check: if account exists and has data, pool is active
@@ -258,6 +264,7 @@ export class PositionTracker {
     try {
       const trimmedAddress = this.walletAddress.trim();
       const walletPubkey = new PublicKey(trimmedAddress);
+      await rpcRateLimiter.waitForSlot();
       const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(walletPubkey, {
         programId: TOKEN_PROGRAM_ID,
       });

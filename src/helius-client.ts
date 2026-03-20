@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { TokenPosition } from './types.js';
+import { rpcRateLimiter } from './rpc-rate-limiter.js';
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
@@ -119,11 +120,6 @@ export class HeliusWsClient {
   private reconnectDelay = 1000;
   private isReconnecting = false;
 
-  // Very lightweight pacing for free-tier-friendly HTTP usage
-  private nextHttpAt = 0;
-  private httpTail: Promise<void> = Promise.resolve();
-  private readonly minHttpIntervalMs = 175;
-
   constructor(config: HeliusWsConfig) {
     this.config = config;
   }
@@ -136,20 +132,7 @@ export class HeliusWsClient {
   }
 
   private async waitForHttpSlot(): Promise<void> {
-    let release!: () => void;
-    const prev = this.httpTail;
-    this.httpTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await prev;
-
-    const now = Date.now();
-    const waitMs = Math.max(0, this.nextHttpAt - now);
-    if (waitMs > 0) await sleep(waitMs);
-    this.nextHttpAt = Date.now() + this.minHttpIntervalMs;
-
-    release();
+    await rpcRateLimiter.waitForSlot();
   }
 
   private async rpcJson<T>(body: unknown, name: string): Promise<T> {
