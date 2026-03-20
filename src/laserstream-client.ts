@@ -39,6 +39,8 @@ export class LaserStreamClient {
   private maxReconnectAttempts = 10;
   private reconnectDelay = 1000;
   private pendingRestart = false;
+  private keepaliveInterval: NodeJS.Timeout | null = null;
+  private pingId = 0;
 
   constructor(config: LaserStreamConfig) {
     this.config = config;
@@ -222,6 +224,7 @@ export class LaserStreamClient {
 
       stream.on('end', () => {
         console.log('[LaserStream] Stream ended');
+        this.stopKeepalive();
         if (this.isRunning && !this.pendingRestart) {
           this.attemptReconnect();
         }
@@ -230,9 +233,38 @@ export class LaserStreamClient {
       // Send initial subscription request
       this.writeSubscriptionRequest();
 
+      // Start keepalive ping (every 30 seconds to prevent 10-min timeout)
+      this.startKeepalive();
+
     } catch (error) {
       console.error('[LaserStream] Failed to start subscription:', error);
       this.attemptReconnect();
+    }
+  }
+
+  /**
+   * Start keepalive ping interval.
+   */
+  private startKeepalive(): void {
+    this.stopKeepalive(); // Clear any existing interval
+    
+    this.keepaliveInterval = setInterval(() => {
+      if (this.stream && typeof this.stream.write === 'function') {
+        this.pingId++;
+        this.stream.write({
+          ping: { id: this.pingId },
+        });
+      }
+    }, 30000); // Ping every 30 seconds
+  }
+
+  /**
+   * Stop keepalive ping interval.
+   */
+  private stopKeepalive(): void {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
     }
   }
 
@@ -361,6 +393,11 @@ export class LaserStreamClient {
    * Disconnect from LaserStream.
    */
   disconnect(): void {
+    this.stopKeepalive();
+    if (this.stream) {
+      this.stream.cancel();
+      this.stream = null;
+    }
     if (this.client) {
       this.client.close();
       this.client = null;
