@@ -4,6 +4,7 @@ import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import { Raydium, PoolUtils } from "@raydium-io/raydium-sdk-v2";
 import BN from "bn.js";
 import { HeliusWsClient } from "./helius-client.js";
+import { LaserStreamClient } from "./laserstream-client.js";
 import { PositionTracker } from "./position-tracker.js";
 import { ClmmSeller, PrecomputedSellContext } from "./clmm-seller.js";
 import { TokenPosition } from "./types.js";
@@ -21,6 +22,10 @@ interface BotConfig {
   // - paid: Single API key handles all positions
   heliusPlan: "free" | "paid";
   heliusApiKeys: string[]; // Array of API keys for free plan
+
+  // LaserStream gRPC endpoint for fast rug detection
+  laserstreamEndpoint?: string;
+  laserstreamApiKey?: string; // Separate API key for LaserStream gRPC (if different from Helius)
 
   flashblockApiKey: string;
   flashblockUrl: string;
@@ -71,6 +76,7 @@ interface MonitoredPosition {
  */
 class RugDefenseBot {
   private heliusClient: HeliusWsClient;
+  private laserStreamClient: LaserStreamClient | null = null;
   private positionTracker: PositionTracker;
   private seller: ClmmSeller;
   private connection: Connection;
@@ -211,6 +217,8 @@ class RugDefenseBot {
       staleTokenBalanceMs: config.staleTokenBalanceMs ?? 90_000,
       flashblockBackupUrl: config.flashblockBackupUrl ?? "",
       heliusSenderUrl: config.heliusSenderUrl ?? "",
+      laserstreamEndpoint: config.laserstreamEndpoint ?? "laserstream-mainnet.helius-rpc.com:443",
+      laserstreamApiKey: config.laserstreamApiKey ?? "",
     };
 
     // Build initial HTTP URL with first API key
@@ -251,6 +259,41 @@ class RugDefenseBot {
       confirmAfterSend: this.config.confirmAfterSend,
       commitment: this.config.commitment,
     });
+
+    // Initialize LaserStream client for fast rug detection via gRPC
+    if (this.config.laserstreamApiKey && this.config.laserstreamEndpoint) {
+      this.laserStreamClient = new LaserStreamClient({
+        apiKey: this.config.laserstreamApiKey,
+        endpoint: this.config.laserstreamEndpoint,
+        onTransaction: (signature: string, accounts: string[]) => {
+          // Find which position this transaction affects
+          for (const account of accounts) {
+            const tokenMint = this.findTokenMintByAccount(account);
+            if (tokenMint) {
+              console.log(`[LaserStream] Triggering sell for ${tokenMint.slice(0, 12)}...`);
+              this.handleLiquidityRemoval(tokenMint, signature);
+              return;
+            }
+          }
+        },
+        onError: (error: Error) => {
+          console.error("[LaserStream] Error:", error.message);
+        },
+        onConnect: () => {
+          console.log("[LaserStream] Connected and streaming");
+        },
+      });
+    }
+  }
+
+  /**
+   * Find token mint by monitored account (fast-detection or dev token account).
+   */
+  private findTokenMintByAccount(account: string): string | undefined {
+    const position = this.positionTracker.getPositions().find(
+      (p) => p.fastDetectionAccount === account || p.devTokenAccount === account
+    );
+    return position?.tokenMint;
   }
 
   async start(): Promise<void> {
@@ -290,6 +333,12 @@ class RugDefenseBot {
     // Connect to Helius WebSocket
     await this.heliusClient.connect();
     this.heliusClient.subscribeToWalletLogs(this.config.walletAddress);
+
+    // Start LaserStream gRPC client for fast rug detection
+    if (this.laserStreamClient) {
+      console.log("[Bot] Starting LaserStream gRPC client...");
+      await this.laserStreamClient.start();
+    }
 
     // Set up monitoring for each position with API key assignment
     for (const position of positions) {
@@ -345,11 +394,24 @@ class RugDefenseBot {
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
 
-        // Use dev token account for fast-detection via logsSubscribe
-        // Any transaction mentioning the dev's token account = rug detected
-        position.fastDetectionAccount = devTokenAccount;
-        this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
-        console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
+        // Get fast-detection account for faster rug detection
+        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+        position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
+        position.devTokenAccount = devTokenAccount;
+
+        // Add to LaserStream for gRPC-based monitoring (both accounts)
+        if (this.laserStreamClient) {
+          this.laserStreamClient.addPosition(
+            position.fastDetectionAccount,
+            devTokenAccount,
+            position
+          );
+          console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+        } else {
+          // Fallback to WebSocket logsSubscribe if LaserStream not available
+          this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+          console.log(`[Bot] Using WebSocket for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+        }
       } else {
         console.warn(
           `[Bot] Cannot monitor existing position ${position.tokenMint.slice(0, 8)}... - missing data`,
@@ -891,11 +953,24 @@ class RugDefenseBot {
       await this.seller.refreshTokenAccounts();
       await this.startPositionMonitoring(position);
 
-      // Use dev token account for fast-detection via logsSubscribe
-      // Any transaction mentioning the dev's token account = rug detected
-      position.fastDetectionAccount = devTokenAccount;
-      this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
-      console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
+      // Get fast-detection account for faster rug detection
+      const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+      position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
+      position.devTokenAccount = devTokenAccount;
+
+      // Add to LaserStream for gRPC-based monitoring (both accounts)
+      if (this.laserStreamClient) {
+        this.laserStreamClient.addPosition(
+          position.fastDetectionAccount,
+          devTokenAccount,
+          position
+        );
+        console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+      } else {
+        // Fallback to WebSocket logsSubscribe if LaserStream not available
+        this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+        console.log(`[Bot] Using WebSocket for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+      }
     } else {
       console.warn(
         `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
@@ -948,11 +1023,24 @@ class RugDefenseBot {
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
 
-        // Use dev token account for fast-detection via logsSubscribe
-        // Any transaction mentioning the dev's token account = rug detected
-        position.fastDetectionAccount = devTokenAccount;
-        this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
-        console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
+        // Get fast-detection account for faster rug detection
+        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
+        position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
+        position.devTokenAccount = devTokenAccount;
+
+        // Add to LaserStream for gRPC-based monitoring (both accounts)
+        if (this.laserStreamClient) {
+          this.laserStreamClient.addPosition(
+            position.fastDetectionAccount,
+            devTokenAccount,
+            position
+          );
+          console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+        } else {
+          // Fallback to WebSocket logsSubscribe if LaserStream not available
+          this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+          console.log(`[Bot] Using WebSocket for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+        }
       } else {
         console.warn(
           `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
@@ -1133,6 +1221,10 @@ async function main() {
     privateKey: process.env.PRIVATE_KEY!,
     heliusPlan,
     heliusApiKeys,
+    // LaserStream gRPC endpoint for fast rug detection (optional)
+    // Requires separate LASERSTREAM_API_KEY from Helius
+    laserstreamEndpoint: process.env.LASERSTREAM_ENDPOINT,
+    laserstreamApiKey: process.env.LASERSTREAM_API_KEY,
     flashblockApiKey: process.env.FLASHBLOCK_API_KEY!,
     flashblockUrl: process.env.FLASHBLOCK_URL!,
     flashblockBackupUrl: process.env.FLASHBLOCK_BACKUP_URL,
