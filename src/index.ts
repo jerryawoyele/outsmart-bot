@@ -345,16 +345,11 @@ class RugDefenseBot {
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
 
-        // Get fast-detection account for faster rug detection
-        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
-        if (fastDetectionAccount) {
-          position.fastDetectionAccount = fastDetectionAccount;
-          this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
-          console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
-        } else {
-          // Fallback to dev token account monitoring
-          this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
-        }
+        // Use dev token account for fast-detection via logsSubscribe
+        // Any transaction mentioning the dev's token account = rug detected
+        position.fastDetectionAccount = devTokenAccount;
+        this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
+        console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
       } else {
         console.warn(
           `[Bot] Cannot monitor existing position ${position.tokenMint.slice(0, 8)}... - missing data`,
@@ -896,18 +891,11 @@ class RugDefenseBot {
       await this.seller.refreshTokenAccounts();
       await this.startPositionMonitoring(position);
 
-      // Get fast-detection account for faster rug detection
-      const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
-      if (fastDetectionAccount) {
-        position.fastDetectionAccount = fastDetectionAccount;
-        // Subscribe to fast-detection account (receives notifications faster)
-        this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
-        console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
-      } else {
-        // Fallback to dev token account monitoring
-        this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
-        console.log(`[Bot] Using dev token account for ${position.tokenMint.slice(0, 8)}...`);
-      }
+      // Use dev token account for fast-detection via logsSubscribe
+      // Any transaction mentioning the dev's token account = rug detected
+      position.fastDetectionAccount = devTokenAccount;
+      this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
+      console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
     } else {
       console.warn(
         `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
@@ -960,18 +948,11 @@ class RugDefenseBot {
       if (position.walletTokenAccount && position.poolAddress) {
         await this.startPositionMonitoring(position);
 
-        // Get fast-detection account for faster rug detection
-        const fastDetectionAccount = await this.heliusClient.getFastDetectionAccount(devTokenAccount);
-        if (fastDetectionAccount) {
-          position.fastDetectionAccount = fastDetectionAccount;
-          // Subscribe to fast-detection account (receives notifications faster)
-          this.heliusClient.subscribeToFastDetectionAccount(fastDetectionAccount, position);
-          console.log(`[Bot] Using fast-detection for ${position.tokenMint.slice(0, 8)}...`);
-        } else {
-          // Fallback to dev token account monitoring
-          this.heliusClient.subscribeToTokenAccount(devTokenAccount, position);
-          console.log(`[Bot] Using dev token account for ${position.tokenMint.slice(0, 8)}...`);
-        }
+        // Use dev token account for fast-detection via logsSubscribe
+        // Any transaction mentioning the dev's token account = rug detected
+        position.fastDetectionAccount = devTokenAccount;
+        this.heliusClient.subscribeToFastDetectionAccount(devTokenAccount, position);
+        console.log(`[Bot] Using dev token account for fast-detection: ${devTokenAccount.slice(0, 12)}...`);
       } else {
         console.warn(
           `[Bot] Cannot start monitoring - missing pool or wallet account for ${position.tokenMint.slice(0, 8)}...`,
