@@ -15,6 +15,16 @@ enum CommitmentLevel {
   FINALIZED = 2;
 }
 
+enum SlotStatus {
+  SLOT_PROCESSED = 0;
+  SLOT_CONFIRMED = 1;
+  SLOT_FINALIZED = 2;
+  SLOT_FIRST_SHRED_RECEIVED = 3;
+  SLOT_COMPLETED = 4;
+  SLOT_CREATED_BANK = 5;
+  SLOT_DEAD = 6;
+}
+
 message SubscribeRequest {
   map<string, SubscribeRequestFilterAccounts> accounts = 1;
   map<string, SubscribeRequestFilterSlots> slots = 2;
@@ -64,48 +74,96 @@ message SubscribeRequestPing {
 }
 
 message PingRequest {
-  int32 id = 1;
+  int32 count = 1;
 }
 
 message PongResponse {
-  int32 id = 1;
+  int32 count = 1;
 }
 
+// Response messages - correct field numbers from official proto
 message SubscribeUpdate {
+  repeated string filters = 1;
   oneof update_oneof {
-    SubscribeUpdateAccount account = 1;
-    SubscribeUpdateTransaction transaction = 3;
-    SubscribeUpdateSlot slot = 7;
-    SubscribeUpdatePong pong = 10;
+    SubscribeUpdateAccount account = 2;
+    SubscribeUpdateSlot slot = 3;
+    SubscribeUpdateTransaction transaction = 4;
+    SubscribeUpdateTransactionStatus transaction_status = 10;
+    SubscribeUpdateBlock block = 5;
+    SubscribeUpdatePing ping = 6;
+    SubscribeUpdatePong pong = 9;
+    SubscribeUpdateBlockMeta block_meta = 7;
+    SubscribeUpdateEntry entry = 8;
   }
-  repeated string filters = 9;
 }
 
 message SubscribeUpdateAccount {
-  string account = 1;
-  string owner = 2;
-  bytes data = 3;
-  uint64 lamports = 4;
-  bool executable = 5;
-  uint64 rent_epoch = 6;
-  bool is_writable = 7;
-  uint64 slot = 8;
+  SubscribeUpdateAccountInfo account = 1;
+  uint64 slot = 2;
+  bool is_startup = 3;
 }
 
-message SubscribeUpdateTransaction {
-  repeated string signatures = 1;
-  bool is_vote = 2;
-  bytes transaction = 3;
-  bytes meta = 4;
-  uint64 slot = 5;
-  int64 block_time = 6;
+message SubscribeUpdateAccountInfo {
+  bytes pubkey = 1;
+  uint64 lamports = 2;
+  bytes owner = 3;
+  bool executable = 4;
+  uint64 rent_epoch = 5;
+  bytes data = 6;
+  uint64 write_version = 7;
 }
 
 message SubscribeUpdateSlot {
   uint64 slot = 1;
-  bool is_parent = 2;
-  string status = 3;
+  optional uint64 parent = 2;
+  SlotStatus status = 3;
 }
+
+message SubscribeUpdateTransaction {
+  SubscribeUpdateTransactionInfo transaction = 1;
+  uint64 slot = 2;
+}
+
+message SubscribeUpdateTransactionInfo {
+  bytes signature = 1;
+  bool is_vote = 2;
+  bytes transaction = 3;
+  bytes meta = 4;
+  uint64 index = 5;
+}
+
+message SubscribeUpdateTransactionStatus {
+  uint64 slot = 1;
+  bytes signature = 2;
+  bool is_vote = 3;
+  uint64 index = 4;
+}
+
+message SubscribeUpdateBlock {
+  uint64 slot = 1;
+  string blockhash = 2;
+  int64 block_time = 4;
+  uint64 block_height = 5;
+  repeated SubscribeUpdateTransactionInfo transactions = 6;
+}
+
+message SubscribeUpdateBlockMeta {
+  uint64 slot = 1;
+  string blockhash = 2;
+  int64 block_time = 4;
+  uint64 block_height = 5;
+  uint64 executed_transaction_count = 8;
+}
+
+message SubscribeUpdateEntry {
+  uint64 slot = 1;
+  uint64 index = 2;
+  uint64 num_hashes = 3;
+  bytes hash = 4;
+  uint64 executed_transaction_count = 5;
+}
+
+message SubscribeUpdatePing {}
 
 message SubscribeUpdatePong {
   int32 id = 1;

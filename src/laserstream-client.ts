@@ -236,35 +236,83 @@ export class LaserStreamClient {
    */
   private handleUpdate(data: any): void {
     try {
-      // Check if this is a transaction update
-      if (data.transaction) {
-        const tx = data.transaction;
-        const signature = tx.signatures?.[0] || tx.signature || 'unknown';
-        
-        // Get accounts involved in the transaction
-        const involvedAccounts: string[] = [];
-        if (tx.account_keys) {
-          involvedAccounts.push(...tx.account_keys);
-        }
+      // Handle pong messages
+      if (data.pong) {
+        console.log('[LaserStream] Received pong');
+        return;
+      }
 
-        // Check if any monitored account is involved
-        for (const account of involvedAccounts) {
-          const tokenMint = this.monitoredAccounts.get(account);
+      // Handle slot updates
+      if (data.slot) {
+        // Slot updates are frequent, only log occasionally
+        return;
+      }
+
+      // Check if this is a transaction update
+      // Structure: { transaction: { transaction: { signature: Buffer, ... }, slot: number } }
+      if (data.transaction) {
+        const txWrapper = data.transaction;
+        const txInfo = txWrapper.transaction;
+        
+        if (!txInfo) return;
+
+        // Skip vote transactions
+        if (txInfo.isVote) return;
+
+        // Signature is a Buffer, convert to base58
+        const signature = txInfo.signature ? this.bufferToBase58(txInfo.signature) : 'unknown';
+        const slot = txWrapper.slot || 0;
+
+        // Get the filters that matched
+        const filters = data.filters || [];
+
+        console.log(
+          `[LaserStream] TX detected - slot: ${slot} sig: ${signature.slice(0, 12)}... filters: ${filters.join(',')}`
+        );
+
+        // Find which monitored accounts are involved via the filter name
+        for (const filterName of filters) {
+          const tokenMint = this.subscriptions.get(filterName)?.position.tokenMint;
           if (tokenMint) {
             console.log(
               `[LaserStream] ⚡ RUG DETECTED - token: ${tokenMint.slice(0, 12)}... ` +
-              `account: ${account.slice(0, 12)}... sig: ${signature.slice(0, 12)}...`
+              `sig: ${signature.slice(0, 12)}...`
             );
             
-            // Trigger the callback
-            this.config.onTransaction?.(signature, involvedAccounts);
-            return; // Only trigger once per transaction
+            // Trigger the callback with the monitored accounts
+            const monitoredAccounts = Array.from(this.monitoredAccounts.keys());
+            this.config.onTransaction?.(signature, monitoredAccounts);
+            return;
           }
         }
       }
     } catch (err) {
       console.error('[LaserStream] Failed to handle update:', err);
     }
+  }
+
+  /**
+   * Convert Buffer to base58 string.
+   */
+  private bufferToBase58(buf: Buffer | Uint8Array): string {
+    const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    
+    let num = BigInt('0x' + bytes.toString('hex'));
+    let result = '';
+    
+    while (num > 0n) {
+      const remainder = Number(num % 58n);
+      result = ALPHABET[remainder] + result;
+      num = num / 58n;
+    }
+    
+    // Add leading zeros
+    for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
+      result = '1' + result;
+    }
+    
+    return result;
   }
 
   /**
