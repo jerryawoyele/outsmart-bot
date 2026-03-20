@@ -144,18 +144,23 @@ export class LaserStreamClient {
     }
 
     const accounts = Array.from(this.monitoredAccounts.keys());
+    
+    // Build transactions filter with each token mint as a separate filter name
+    const transactionsFilter: Record<string, any> = {};
+    for (const [tokenMint, sub] of this.subscriptions) {
+      transactionsFilter[tokenMint] = {
+        vote: false,
+        failed: false,
+        accountInclude: sub.accounts,
+        accountExclude: [],
+        accountRequired: [],
+      };
+    }
+
     const request = {
       accounts: {},
       slots: {},
-      transactions: {
-        rugWatch: {
-          vote: false,
-          failed: false,
-          accountInclude: accounts,
-          accountExclude: [],
-          accountRequired: [],
-        },
-      },
+      transactions: transactionsFilter,
       transactionsStatus: {},
       blocks: {},
       blocksMeta: {},
@@ -165,7 +170,7 @@ export class LaserStreamClient {
     };
 
     this.stream.write(request);
-    console.log(`[LaserStream] Updated subscription for ${accounts.length} accounts`);
+    console.log(`[LaserStream] Updated subscription for ${this.subscriptions.size} positions (${accounts.length} accounts)`);
   }
 
   /**
