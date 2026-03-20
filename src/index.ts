@@ -864,17 +864,6 @@ class RugDefenseBot {
       return;
     }
 
-    // Check if we have capacity for a new position (free plan limit)
-    if (!this.hasCapacityForNewPosition()) {
-      console.warn(
-        `[Bot] ⚠️ No API keys available for ${tokenMint.slice(0, 8)}... - NOT monitoring (free plan limit reached)`,
-      );
-      console.warn(
-        `[Bot] Position will not be rug-protected. Consider upgrading to paid plan or selling manually.`,
-      );
-      return;
-    }
-
     // Temporarily add position to check for CLMM pool
     await this.positionTracker.addPositionWithDev(
       tokenMint,
@@ -902,7 +891,18 @@ class RugDefenseBot {
       return;
     }
 
-    // Found CLMM pool - now assign API key permanently
+    // Found CLMM pool - now check capacity and assign API key
+    if (!this.hasCapacityForNewPosition()) {
+      console.warn(
+        `[Bot] ⚠️ No API keys available for ${tokenMint.slice(0, 8)}... - NOT monitoring (free plan limit reached)`,
+      );
+      console.warn(
+        `[Bot] Position will not be rug-protected. Consider upgrading to paid plan or selling manually.`,
+      );
+      this.positionTracker.removePosition(tokenMint);
+      return;
+    }
+
     const keyIndex = this.assignApiKey(tokenMint);
     if (keyIndex < 0) {
       console.warn(
