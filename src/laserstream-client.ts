@@ -215,11 +215,11 @@ export class LaserStreamClient {
       // Check for rug
       const { trigger, removedRaw, removedPct } = this.shouldRug(currentRaw, tracker);
 
-      console.log(
-        `[VaultWatch] ${tracker.tokenMint.slice(0, 8)}... current=${currentRaw} ` +
-        `highest=${tracker.highestSeenWsolRaw} initial=${tracker.initialWsolRaw} ` +
-        `removed=${removedRaw} (${removedPct.toFixed(1)}%)`
-      );
+      // console.log(
+      //   `[VaultWatch] ${tracker.tokenMint.slice(0, 8)}... current=${currentRaw} ` +
+      //   `highest=${tracker.highestSeenWsolRaw} initial=${tracker.initialWsolRaw} ` +
+      //   `removed=${removedRaw} (${removedPct.toFixed(1)}%)`
+      // );
 
       if (!trigger) return;
 
