@@ -217,6 +217,7 @@ export class LaserStreamClient {
 
       console.log(
         `[VaultWatch] ${tracker.tokenMint.slice(0, 8)}... current=${currentRaw} ` +
+        `highest=${tracker.highestSeenWsolRaw} initial=${tracker.initialWsolRaw} ` +
         `removed=${removedRaw} (${removedPct.toFixed(1)}%)`
       );
 
@@ -286,31 +287,35 @@ export class LaserStreamClient {
 
   /**
    * Determine if a rug has occurred based on balance drop.
-   * Triggers when current balance drops below the initial SOL deposited by the dev.
-   * This is a clear rug signal - the dev removed their initial liquidity.
+   * Triggers when balance drops by >= initial SOL from the highest seen.
+   * This means the dev removed at least their initial liquidity deposit.
    */
   private shouldRug(currentRaw: bigint, tracker: PoolTracker): {
     trigger: boolean;
     removedRaw: bigint;
     removedPct: number;
   } {
-    const baseline = tracker.initialWsolRaw;
+    const highest = tracker.highestSeenWsolRaw;
+    const initial = tracker.initialWsolRaw;
 
-    if (baseline <= 0n) {
+    if (highest <= 0n || initial <= 0n) {
       return { trigger: false, removedRaw: 0n, removedPct: 0 };
     }
 
-    // If current balance is at or above initial, no rug
-    if (currentRaw >= baseline) {
+    // If current balance is at or above highest, no rug
+    if (currentRaw >= highest) {
       return { trigger: false, removedRaw: 0n, removedPct: 0 };
     }
 
-    // Balance dropped below initial SOL - RUG DETECTED
-    const removedRaw = baseline - currentRaw;
-    const removedPct = Number((removedRaw * 10_000n) / baseline) / 100;
+    // Calculate how much was removed from highest
+    const removedRaw = highest - currentRaw;
+    const removedPct = Number((removedRaw * 10_000n) / highest) / 100;
+
+    // Trigger when removed >= initial SOL (dev pulled out their initial deposit)
+    const trigger = removedRaw >= initial;
 
     return {
-      trigger: true, // Always trigger when below initial
+      trigger,
       removedRaw,
       removedPct,
     };
