@@ -76,6 +76,7 @@ export class LaserStreamClient {
     if (wsolVault) {
       this.trackers.delete(wsolVault);
       this.tokenToVault.delete(tokenMint);
+      console.log(`[LaserStream] Removed vault watch for ${tokenMint.slice(0, 8)}...`);
       
       if (this.isRunning && this.trackers.size > 0) {
         this.restartSubscription();
