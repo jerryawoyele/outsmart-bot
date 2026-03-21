@@ -39,7 +39,7 @@ import { rpcRateLimiter } from "./rpc-rate-limiter.js";
  */
 
 const DEFAULT_WSOL_MINT = "So11111111111111111111111111111111111111112";
-const MIN_TIP_LAMPORTS = 600_000;
+const MIN_TIP_LAMPORTS = 300_000;
 
 /**
  * Keep your current tip wallet list for now.

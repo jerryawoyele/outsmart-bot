@@ -861,6 +861,11 @@ class RugDefenseBot {
             );
           }
 
+          // Remove from LaserStream monitoring
+          if (this.laserStreamClient) {
+            this.laserStreamClient.removePosition(knownToken);
+          }
+
           this.stopPositionMonitoring(knownToken);
           this.positionTracker.removePosition(knownToken);
           this.knownTokens.delete(knownToken);
