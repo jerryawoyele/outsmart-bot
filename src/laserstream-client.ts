@@ -1,6 +1,6 @@
 import { subscribe, CommitmentLevel, LaserstreamConfig, SubscribeRequest, StreamHandle } from 'helius-laserstream';
 import { AccountLayout } from '@solana/spl-token';
-import { TokenPosition } from './types.js';
+import bs58 from 'bs58';
 
 export interface LaserStreamConfig {
   apiKey: string;
@@ -241,13 +241,14 @@ export class LaserStreamClient {
 
   /**
    * Extract pubkey from various formats.
+   * Returns base58-encoded string for Solana addresses.
    */
   private extractPubkey(pubkey: any): string | null {
     if (typeof pubkey === 'string') {
       return pubkey;
     }
     if (pubkey instanceof Uint8Array || Buffer.isBuffer(pubkey)) {
-      return Buffer.from(pubkey).toString('base64');
+      return bs58.encode(Buffer.from(pubkey));
     }
     return null;
   }
