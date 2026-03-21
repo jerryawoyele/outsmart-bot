@@ -1,27 +1,35 @@
 import { subscribe, CommitmentLevel, LaserstreamConfig, SubscribeRequest, StreamHandle } from 'helius-laserstream';
+import { AccountLayout } from '@solana/spl-token';
 import { TokenPosition } from './types.js';
 
 export interface LaserStreamConfig {
   apiKey: string;
   endpoint: string;
-  onTransaction?: (signature: string, filterName: string, tokenMint: string) => void;
+  onRugDetected?: (tokenMint: string, removedRaw: bigint, removedPct: number) => void;
   onError?: (error: Error) => void;
   onConnect?: () => void;
 }
 
-export interface LaserStreamSubscription {
-  accounts: string[];
-  position: TokenPosition;
+/**
+ * Pool tracker for monitoring WSOL vault balance
+ */
+export interface PoolTracker {
+  tokenMint: string;
+  wsolVault: string;
+  initialWsolRaw: bigint;
+  highestSeenWsolRaw: bigint;
+  rugged: boolean;
 }
 
 /**
  * LaserStream gRPC client for fast rug detection.
- * Uses the official helius-laserstream npm package.
+ * Uses account subscriptions to monitor WSOL vault balances directly.
+ * Triggers sell when vault balance drops significantly (rug detection).
  */
 export class LaserStreamClient {
   private config: LaserStreamConfig;
-  private subscriptions: Map<string, LaserStreamSubscription> = new Map(); // tokenMint -> subscription
-  private monitoredAccounts: Map<string, string> = new Map(); // account -> tokenMint
+  private trackers: Map<string, PoolTracker> = new Map(); // wsolVault -> tracker
+  private tokenToVault: Map<string, string> = new Map(); // tokenMint -> wsolVault
   private isRunning = false;
   private streamHandle: StreamHandle | null = null;
 
@@ -30,29 +38,28 @@ export class LaserStreamClient {
   }
 
   /**
-   * Add accounts to monitor for a token position.
-   * Both fastDetectionAccount and devTokenAccount will be monitored.
+   * Add a position to monitor by its WSOL vault.
+   * This is the key method - we monitor the WSOL vault balance directly.
    */
   addPosition(
-    fastDetectionAccount: string,
-    devTokenAccount: string,
-    position: TokenPosition
+    tokenMint: string,
+    wsolVault: string,
+    initialWsolRaw: bigint
   ): void {
-    const accounts = [fastDetectionAccount, devTokenAccount];
-    
-    this.subscriptions.set(position.tokenMint, {
-      accounts,
-      position,
-    });
+    const tracker: PoolTracker = {
+      tokenMint,
+      wsolVault,
+      initialWsolRaw,
+      highestSeenWsolRaw: initialWsolRaw,
+      rugged: false,
+    };
 
-    // Map each account to the token mint for quick lookup
-    for (const account of accounts) {
-      this.monitoredAccounts.set(account, position.tokenMint);
-    }
+    this.trackers.set(wsolVault, tracker);
+    this.tokenToVault.set(tokenMint, wsolVault);
 
     console.log(
-      `[LaserStream] Added position ${position.tokenMint.slice(0, 8)}... ` +
-      `accounts: ${fastDetectionAccount.slice(0, 8)}..., ${devTokenAccount.slice(0, 8)}...`
+      `[LaserStream] Added vault watch for ${tokenMint.slice(0, 8)}... ` +
+      `vault: ${wsolVault.slice(0, 8)}... initial: ${initialWsolRaw} lamports`
     );
 
     // If already running, restart with new subscription
@@ -65,14 +72,12 @@ export class LaserStreamClient {
    * Remove a position from monitoring.
    */
   removePosition(tokenMint: string): void {
-    const sub = this.subscriptions.get(tokenMint);
-    if (sub) {
-      for (const account of sub.accounts) {
-        this.monitoredAccounts.delete(account);
-      }
-      this.subscriptions.delete(tokenMint);
+    const wsolVault = this.tokenToVault.get(tokenMint);
+    if (wsolVault) {
+      this.trackers.delete(wsolVault);
+      this.tokenToVault.delete(tokenMint);
       
-      if (this.isRunning && this.subscriptions.size > 0) {
+      if (this.isRunning && this.trackers.size > 0) {
         this.restartSubscription();
       }
     }
@@ -90,8 +95,8 @@ export class LaserStreamClient {
    * Start the subscription stream.
    */
   async start(): Promise<void> {
-    if (this.monitoredAccounts.size === 0) {
-      console.log('[LaserStream] No accounts to monitor yet - will subscribe when positions added');
+    if (this.trackers.size === 0) {
+      console.log('[LaserStream] No vaults to monitor yet - will subscribe when positions added');
       this.isRunning = true;
       return;
     }
@@ -101,37 +106,34 @@ export class LaserStreamClient {
   }
 
   /**
-   * Start or restart the gRPC subscription with current accounts.
+   * Start or restart the gRPC subscription with current vaults.
    */
   private async startSubscription(): Promise<void> {
-    if (this.subscriptions.size === 0) {
-      console.log('[LaserStream] No subscriptions to monitor');
+    if (this.trackers.size === 0) {
+      console.log('[LaserStream] No vaults to monitor');
       return;
     }
 
-    const accounts = Array.from(this.monitoredAccounts.keys());
-    console.log(`[LaserStream] Starting subscription for ${accounts.length} accounts`);
+    const vaults = Array.from(this.trackers.keys());
+    console.log(`[LaserStream] Starting account subscription for ${vaults.length} WSOL vaults`);
 
-    // Build transactions filter with each token mint as a separate filter name
-    const transactionsFilter: Record<string, any> = {};
-    for (const [tokenMint, sub] of this.subscriptions) {
-      transactionsFilter[tokenMint] = {
-        vote: false,
-        failed: false,
-        accountInclude: sub.accounts,
-        accountExclude: [],
-        accountRequired: [],
-      };
-    }
+    // Build accounts filter for WSOL vault monitoring
+    const accountsFilter: Record<string, any> = {
+      rugVaultWatch: {
+        account: vaults,
+        owner: [],
+        filters: [{ tokenAccountState: true }],
+      },
+    };
 
     const subscriptionRequest: SubscribeRequest = {
-      transactions: transactionsFilter,
+      accounts: accountsFilter,
       commitment: CommitmentLevel.PROCESSED,
-      accounts: {},
-      slots: {},
+      transactions: {},
       transactionsStatus: {},
       blocks: {},
       blocksMeta: {},
+      slots: {},
       entry: {},
       accountsDataSlice: [],
     };
@@ -145,14 +147,14 @@ export class LaserStreamClient {
       this.streamHandle = await subscribe(
         laserstreamConfig,
         subscriptionRequest,
-        (data: any) => this.handleUpdate(data),
+        (data: any) => this.handleAccountUpdate(data),
         (error: Error) => {
           console.error('[LaserStream] Stream error:', error.message);
           this.config.onError?.(error);
         }
       );
 
-      console.log(`[LaserStream] Updated subscription for ${this.subscriptions.size} positions (${accounts.length} accounts)`);
+      console.log(`[LaserStream] Monitoring ${this.trackers.size} WSOL vaults for rug detection`);
     } catch (error) {
       console.error('[LaserStream] Failed to start subscription:', error);
       this.config.onError?.(error as Error);
@@ -160,7 +162,7 @@ export class LaserStreamClient {
   }
 
   /**
-   * Restart subscription with current accounts.
+   * Restart subscription with current vaults.
    */
   private restartSubscription(): void {
     // Cancel current stream
@@ -171,7 +173,7 @@ export class LaserStreamClient {
 
     // Small delay to allow cleanup, then restart
     setTimeout(() => {
-      if (this.isRunning && this.subscriptions.size > 0) {
+      if (this.isRunning && this.trackers.size > 0) {
         this.startSubscription().catch(err => {
           console.error('[LaserStream] Failed to restart subscription:', err);
         });
@@ -180,44 +182,137 @@ export class LaserStreamClient {
   }
 
   /**
-   * Handle incoming update from stream.
+   * Handle incoming account update from stream.
+   * This is where we detect rugs by monitoring WSOL vault balance changes.
    */
-  private handleUpdate(data: any): void {
+  private handleAccountUpdate(data: any): void {
     try {
-      // Check if this is a transaction update - trigger sell immediately
-      if (data.transaction) {
-        const tx = data.transaction;
-        const signature = tx.signature || 'unknown';
-        const slot = tx.slot || 0;
+      // Check if this is an account update
+      if (!data.account) return;
 
-        // Get the filter that matched (tells us which position)
-        const filters = data.filters || [];
+      const accountUpdate = data.account;
+      const accountInfo = accountUpdate.account;
+      if (!accountInfo) return;
 
-        console.log(
-          `[LaserStream] ⚡ TX DETECTED - slot: ${slot} sig: ${signature.slice(0, 12)}... filters: ${filters.join(',')}`
-        );
+      // Get the pubkey (vault address)
+      const pubkey = this.extractPubkey(accountInfo.pubkey);
+      if (!pubkey) return;
 
-        // Find the position that matched and trigger sell
-        for (const filterName of filters) {
-          const subscription = this.subscriptions.get(filterName);
-          if (subscription) {
-            const tokenMint = subscription.position.tokenMint;
-            console.log(
-              `[LaserStream] ⚡ RUG DETECTED - token: ${tokenMint.slice(0, 12)}... - TRIGGERING SELL`
-            );
-            
-            // Trigger the callback with the specific token mint
-            this.config.onTransaction?.(signature, filterName, tokenMint);
-            
-            // Remove this position from monitoring after detection
-            this.removePosition(tokenMint);
-            return; // Only handle one match
-          }
-        }
+      const tracker = this.trackers.get(pubkey);
+      if (!tracker || tracker.rugged) return;
+
+      // Decode the account data to get WSOL balance
+      const rawData = this.extractData(accountInfo.data);
+      if (!rawData) return;
+
+      const currentRaw = this.decodeSplAmount(rawData);
+
+      // Update highest seen if balance increased
+      if (currentRaw > tracker.highestSeenWsolRaw) {
+        tracker.highestSeenWsolRaw = currentRaw;
       }
+
+      // Check for rug
+      const { trigger, removedRaw, removedPct } = this.shouldRug(currentRaw, tracker);
+
+      console.log(
+        `[VaultWatch] ${tracker.tokenMint.slice(0, 8)}... current=${currentRaw} ` +
+        `removed=${removedRaw} (${removedPct.toFixed(1)}%)`
+      );
+
+      if (!trigger) return;
+
+      // Mark as rugged to prevent duplicate triggers
+      tracker.rugged = true;
+      console.log(
+        `[LaserStream] ⚡ RUG DETECTED - token: ${tracker.tokenMint.slice(0, 12)}... ` +
+        `removed=${removedRaw} lamports (${removedPct.toFixed(1)}%)`
+      );
+
+      // Trigger the callback
+      this.config.onRugDetected?.(tracker.tokenMint, removedRaw, removedPct);
+
+      // Remove from monitoring
+      this.removePosition(tracker.tokenMint);
     } catch (err) {
-      console.error('[LaserStream] Failed to handle update:', err);
+      console.error('[LaserStream] Failed to handle account update:', err);
     }
+  }
+
+  /**
+   * Extract pubkey from various formats.
+   */
+  private extractPubkey(pubkey: any): string | null {
+    if (typeof pubkey === 'string') {
+      return pubkey;
+    }
+    if (pubkey instanceof Uint8Array || Buffer.isBuffer(pubkey)) {
+      return Buffer.from(pubkey).toString('base64');
+    }
+    return null;
+  }
+
+  /**
+   * Extract account data from various formats.
+   */
+  private extractData(data: any): Uint8Array | null {
+    if (data instanceof Uint8Array) {
+      return data;
+    }
+    if (Buffer.isBuffer(data)) {
+      return data;
+    }
+    if (typeof data === 'string') {
+      // Base64 encoded
+      return Buffer.from(data, 'base64');
+    }
+    return null;
+  }
+
+  /**
+   * Decode SPL token account amount from raw data.
+   */
+  private decodeSplAmount(data: Uint8Array | Buffer): bigint {
+    const buf = Buffer.from(data);
+    try {
+      const decoded = AccountLayout.decode(buf);
+      return decoded.amount;
+    } catch {
+      // Fallback: amount is at offset 64 for token accounts
+      return buf.readBigUInt64LE(64);
+    }
+  }
+
+  /**
+   * Determine if a rug has occurred based on balance drop.
+   * Triggers when current balance drops below the initial SOL deposited by the dev.
+   * This is a clear rug signal - the dev removed their initial liquidity.
+   */
+  private shouldRug(currentRaw: bigint, tracker: PoolTracker): {
+    trigger: boolean;
+    removedRaw: bigint;
+    removedPct: number;
+  } {
+    const baseline = tracker.initialWsolRaw;
+
+    if (baseline <= 0n) {
+      return { trigger: false, removedRaw: 0n, removedPct: 0 };
+    }
+
+    // If current balance is at or above initial, no rug
+    if (currentRaw >= baseline) {
+      return { trigger: false, removedRaw: 0n, removedPct: 0 };
+    }
+
+    // Balance dropped below initial SOL - RUG DETECTED
+    const removedRaw = baseline - currentRaw;
+    const removedPct = Number((removedRaw * 10_000n) / baseline) / 100;
+
+    return {
+      trigger: true, // Always trigger when below initial
+      removedRaw,
+      removedPct,
+    };
   }
 
   /**
@@ -233,9 +328,9 @@ export class LaserStreamClient {
   }
 
   /**
-   * Get number of monitored positions.
+   * Get number of monitored vaults.
    */
   getPositionCount(): number {
-    return this.subscriptions.size;
+    return this.trackers.size;
   }
 }

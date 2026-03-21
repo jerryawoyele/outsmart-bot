@@ -266,10 +266,13 @@ class RugDefenseBot {
       this.laserStreamClient = new LaserStreamClient({
         apiKey: this.config.laserstreamApiKey,
         endpoint: this.config.laserstreamEndpoint,
-        onTransaction: (signature: string, filterName: string, tokenMint: string) => {
+        onRugDetected: (tokenMint: string, removedRaw: bigint, removedPct: number) => {
           // Sell the specific position that was detected
-          console.log(`[LaserStream] Triggering sell for ${tokenMint.slice(0, 12)}...`);
-          this.handleLiquidityRemoval(tokenMint, signature);
+          console.log(
+            `[LaserStream] RUG DETECTED - Triggering sell for ${tokenMint.slice(0, 12)}... ` +
+            `removed=${removedRaw} lamports (${removedPct.toFixed(1)}%)`
+          );
+          this.handleLiquidityRemoval(tokenMint, `vault-balance-drop-${removedPct.toFixed(0)}pct`);
           // Position is already removed from monitoring in LaserStreamClient
         },
         onError: (error: Error) => {
@@ -395,14 +398,27 @@ class RugDefenseBot {
         position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
         position.devTokenAccount = devTokenAccount;
 
-        // Add to LaserStream for gRPC-based monitoring (both accounts)
+        // Add to LaserStream for account-based WSOL vault monitoring
         if (this.laserStreamClient) {
-          this.laserStreamClient.addPosition(
-            position.fastDetectionAccount,
-            devTokenAccount,
-            position
-          );
-          console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+          // Get WSOL vault and initial SOL from token account's latest transaction
+          const vaultInfo = await this.heliusClient.getWsolVaultFromTokenAccount(devTokenAccount);
+          
+          if (vaultInfo) {
+            this.laserStreamClient.addPosition(
+              position.tokenMint,
+              vaultInfo.wsolVault,
+              vaultInfo.initialSolRaw
+            );
+            console.log(
+              `[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... ` +
+              `vault: ${vaultInfo.wsolVault.slice(0, 8)}... initial: ${vaultInfo.initialSolRaw} lamports`
+            );
+          } else {
+            console.warn(`[Bot] Could not find WSOL vault for ${position.tokenMint.slice(0, 8)}...`);
+            // Fallback to WebSocket logsSubscribe
+            this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+            console.log(`[Bot] Using WebSocket fallback for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+          }
         } else {
           // Fallback to WebSocket logsSubscribe if LaserStream not available
           this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
@@ -958,14 +974,27 @@ class RugDefenseBot {
       position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
       position.devTokenAccount = devTokenAccount;
 
-      // Add to LaserStream for gRPC-based monitoring (both accounts)
+      // Add to LaserStream for account-based WSOL vault monitoring
       if (this.laserStreamClient) {
-        this.laserStreamClient.addPosition(
-          position.fastDetectionAccount,
-          devTokenAccount,
-          position
-        );
-        console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+        // Get WSOL vault and initial SOL from token account's latest transaction
+        const vaultInfo = await this.heliusClient.getWsolVaultFromTokenAccount(devTokenAccount);
+        
+        if (vaultInfo) {
+          this.laserStreamClient.addPosition(
+            position.tokenMint,
+            vaultInfo.wsolVault,
+            vaultInfo.initialSolRaw
+          );
+          console.log(
+            `[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... ` +
+            `vault: ${vaultInfo.wsolVault.slice(0, 8)}... initial: ${vaultInfo.initialSolRaw} lamports`
+          );
+        } else {
+          console.warn(`[Bot] Could not find WSOL vault for ${position.tokenMint.slice(0, 8)}...`);
+          // Fallback to WebSocket logsSubscribe
+          this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+          console.log(`[Bot] Using WebSocket fallback for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+        }
       } else {
         // Fallback to WebSocket logsSubscribe if LaserStream not available
         this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
@@ -1028,14 +1057,27 @@ class RugDefenseBot {
         position.fastDetectionAccount = fastDetectionAccount || devTokenAccount;
         position.devTokenAccount = devTokenAccount;
 
-        // Add to LaserStream for gRPC-based monitoring (both accounts)
+        // Add to LaserStream for account-based WSOL vault monitoring
         if (this.laserStreamClient) {
-          this.laserStreamClient.addPosition(
-            position.fastDetectionAccount,
-            devTokenAccount,
-            position
-          );
-          console.log(`[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... (fast: ${position.fastDetectionAccount.slice(0, 8)}..., dev: ${devTokenAccount.slice(0, 8)}...)`);
+          // Get WSOL vault and initial SOL from token account's latest transaction
+          const vaultInfo = await this.heliusClient.getWsolVaultFromTokenAccount(devTokenAccount);
+          
+          if (vaultInfo) {
+            this.laserStreamClient.addPosition(
+              position.tokenMint,
+              vaultInfo.wsolVault,
+              vaultInfo.initialSolRaw
+            );
+            console.log(
+              `[Bot] Added to LaserStream: ${position.tokenMint.slice(0, 8)}... ` +
+              `vault: ${vaultInfo.wsolVault.slice(0, 8)}... initial: ${vaultInfo.initialSolRaw} lamports`
+            );
+          } else {
+            console.warn(`[Bot] Could not find WSOL vault for ${position.tokenMint.slice(0, 8)}...`);
+            // Fallback to WebSocket logsSubscribe
+            this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);
+            console.log(`[Bot] Using WebSocket fallback for fast-detection: ${position.fastDetectionAccount.slice(0, 12)}...`);
+          }
         } else {
           // Fallback to WebSocket logsSubscribe if LaserStream not available
           this.heliusClient.subscribeToFastDetectionAccount(position.fastDetectionAccount, position);

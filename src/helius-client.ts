@@ -920,4 +920,117 @@ export class HeliusWsClient {
       this.ws = null;
     }
   }
+
+  /**
+   * Get WSOL vault address and initial SOL amount from token account's latest transaction.
+   * Used to find the CLMM pool's WSOL vault for rug detection.
+   * 
+   * Process:
+   * 1. Get latest transaction for the token account
+   * 2. Find the WSOL vault from tokenTransfers (first transfer with WSOL mint)
+   * 3. Get initial SOL amount from tokenAmount field
+   * 
+   * @param tokenAccount - The token account to look up
+   * @returns Object with wsolVault address and initialSolRaw (in lamports), or null if not found
+   */
+  async getWsolVaultFromTokenAccount(tokenAccount: string): Promise<{ wsolVault: string; initialSolRaw: bigint } | null> {
+    try {
+      // Build proper URL for Helius enhanced API
+      // Extract base URL and API key from rpcUrl
+      const rpcUrlParts = this.config.rpcUrl.split('?');
+      const baseUrl = rpcUrlParts[0].replace('/v0/addresses', '');
+      const apiKeyMatch = this.config.rpcUrl.match(/api-key=([^&]+)/);
+      const apiKey = apiKeyMatch ? apiKeyMatch[1] : '';
+      
+      const txUrl = `${baseUrl}/v0/addresses/${tokenAccount}/transactions?sort-order=desc&limit=1&api-key=${apiKey}`;
+      
+      const transactions = await this.httpJson<any[]>(txUrl, 'getWsolVaultFromTokenAccount');
+      
+      if (!transactions || transactions.length === 0) {
+        console.log(`[Helius] No transactions found for token account ${tokenAccount.slice(0, 8)}...`);
+        return null;
+      }
+
+      const tx = transactions[0];
+      
+      // Look for WSOL vault in tokenTransfers - find the first transfer with WSOL mint
+      // This gives us both the vault address (toTokenAccount) and initial SOL amount (tokenAmount)
+      if (tx.tokenTransfers && Array.isArray(tx.tokenTransfers)) {
+        for (const tokenTransfer of tx.tokenTransfers) {
+          // Check if this is a WSOL transfer (mint is WSOL)
+          if (tokenTransfer.mint === 'So11111111111111111111111111111111111111112') {
+            const wsolVault = tokenTransfer.toTokenAccount;
+            const tokenAmount = tokenTransfer.tokenAmount; // This is in SOL (e.g., 279.999996104)
+            
+            // Convert SOL amount to lamports (multiply by 1e9)
+            const initialSolRaw = BigInt(Math.floor(tokenAmount * 1_000_000_000));
+            
+            console.log(
+              `[Helius] Found WSOL vault ${wsolVault.slice(0, 12)}... ` +
+              `with initial SOL: ${tokenAmount} (${initialSolRaw} lamports) ` +
+              `for token account ${tokenAccount.slice(0, 8)}...`
+            );
+            
+            return { wsolVault, initialSolRaw };
+          }
+        }
+      }
+
+      // Fallback: Look in accountData for WSOL token balance changes
+      if (tx.accountData && Array.isArray(tx.accountData)) {
+        for (const acc of tx.accountData) {
+          if (acc.tokenBalanceChanges) {
+            for (const tokenChange of acc.tokenBalanceChanges) {
+              if (tokenChange.mint === 'So11111111111111111111111111111111111111112') {
+                // Found WSOL vault
+                const wsolVault = acc.account;
+                // Get initial balance from rawTokenAmount
+                const rawAmount = tokenChange.rawTokenAmount?.tokenAmount;
+                if (rawAmount) {
+                  const initialSolRaw = BigInt(rawAmount);
+                  console.log(
+                    `[Helius] Found WSOL vault (fallback) ${wsolVault.slice(0, 12)}... ` +
+                    `with initial SOL: ${initialSolRaw} lamports ` +
+                    `for token account ${tokenAccount.slice(0, 8)}...`
+                  );
+                  return { wsolVault, initialSolRaw };
+                }
+              }
+            }
+          }
+        }
+      }
+
+      console.log(`[Helius] Could not find WSOL vault in transaction for ${tokenAccount.slice(0, 8)}...`);
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get WSOL vault: ${error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Get WSOL balance of a vault account via RPC
+   */
+  async getWsolBalance(vaultAddress: string): Promise<bigint | null> {
+    try {
+      const data = await this.rpcJson<{ result?: { value: { amount: string } } }>(
+        {
+          jsonrpc: '2.0',
+          id: '1',
+          method: 'getTokenAccountBalance',
+          params: [vaultAddress, { commitment: 'processed' }],
+        },
+        `getWsolBalance(${vaultAddress.slice(0, 8)}...)`
+      );
+
+      if (data.result?.value?.amount) {
+        return BigInt(data.result.value.amount);
+      }
+      return null;
+    } catch (error) {
+      console.error(`[Helius] Failed to get WSOL balance: ${error}`);
+      return null;
+    }
+  }
 }
