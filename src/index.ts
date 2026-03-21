@@ -7,6 +7,7 @@ import { HeliusWsClient } from "./helius-client.js";
 import { LaserStreamClient } from "./laserstream-client.js";
 import { PositionTracker } from "./position-tracker.js";
 import { ClmmSeller, PrecomputedSellContext } from "./clmm-seller.js";
+import { JupiterUltraSeller } from "./jupiter-ultra-seller.js";
 import { TokenPosition } from "./types.js";
 import { rpcRateLimiter } from "./rpc-rate-limiter.js";
 
@@ -80,11 +81,13 @@ class RugDefenseBot {
   private laserStreamClient: LaserStreamClient | null = null;
   private positionTracker: PositionTracker;
   private seller: ClmmSeller;
+  private jupiterSeller: JupiterUltraSeller; // Added property
   private connection: Connection;
   private raydium: Awaited<ReturnType<typeof Raydium.load>> | null = null;
   private config: Required<BotConfig>;
 
   private isRunning = false;
+  private startTime: number = 0; // Track when bot started // Added property
   private pendingSells: Map<string, Promise<void>> = new Map();
   private knownTokens: Set<string> = new Set();
   private checkedTokens: Set<string> = new Set();
@@ -261,6 +264,16 @@ class RugDefenseBot {
       commitment: this.config.commitment,
     });
 
+    // Initialize Jupiter Ultra seller as fallback for missing pools
+    this.jupiterSeller = new JupiterUltraSeller({
+      rpcUrl: initialHttpUrl,
+      privateKey: config.privateKey,
+      jupiterApiKey: "", // Jupiter Ultra doesn't require API key
+      defaultSlippageBps: 10000, // 100% slippage for emergency sells
+      defaultPriorityFeeLamports: 150000,
+      jitoTipLamports: 0, // No tip for fallback sells
+    });
+
     // Initialize LaserStream client for fast rug detection via gRPC
     if (this.config.laserstreamApiKey && this.config.laserstreamEndpoint) {
       this.laserStreamClient = new LaserStreamClient({
@@ -301,6 +314,7 @@ class RugDefenseBot {
       return;
     }
 
+    this.startTime = Date.now(); // Track when bot started
     console.log("[Bot] Starting Rug Defense Bot...");
     console.log(`[Bot] Wallet: ${this.config.walletAddress}`);
 
@@ -949,9 +963,62 @@ class RugDefenseBot {
         `[Bot] Found pool for ${position.tokenMint.slice(0, 8)}...: ${poolAddress.slice(0, 12)}...`,
       );
     } else {
-      console.warn(
-        `[Bot] Could not find pool for ${position.tokenMint.slice(0, 8)}... - skipping`,
-      );
+      // Check if bot has been running for more than 3 minutes
+      const runningMs = Date.now() - this.startTime;
+      const threeMinutesMs = 3 * 60 * 1000;
+      
+      if (runningMs > threeMinutesMs) {
+        // Bot has been running > 3 mins - sell position via Jupiter fallback
+        console.warn(
+          `[Bot] Could not find pool for ${position.tokenMint.slice(0, 8)}... - selling via Jupiter fallback`,
+        );
+        
+        // Get user's token account for this mint
+        const userTokenAccount = position.walletTokenAccount || 
+          await this.heliusClient.getUserTokenAccount(this.config.walletAddress, position.tokenMint);
+        
+        if (userTokenAccount) {
+          try {
+            // Prepare and execute Jupiter sell with 0 tip
+            const prepKey = await this.jupiterSeller.prepareEmergencySell({
+              inputMint: position.tokenMint,
+              tokenAccount: userTokenAccount,
+            });
+            
+            const result = await this.jupiterSeller.emergencySellPrepared({
+              prepKey,
+              sellPercent: 100,
+              slippageBps: 10000, // 100% slippage
+              priorityFeeLamports: 150000,
+              jitoTipLamports: 0, // No tip for fallback sells
+            });
+            
+            if (result.success) {
+              console.log(
+                `[Bot] ✅ Sold ${position.tokenMint.slice(0, 8)}... via Jupiter (no pool found) - tx: ${result.txSignature?.slice(0, 12)}...`
+              );
+            } else {
+              console.error(
+                `[Bot] ❌ Failed to sell ${position.tokenMint.slice(0, 8)}... via Jupiter: ${result.error}`
+              );
+            }
+          } catch (err) {
+            console.error(
+              `[Bot] ❌ Jupiter fallback sell failed for ${position.tokenMint.slice(0, 8)}...: ${err}`
+            );
+          }
+        } else {
+          console.warn(
+            `[Bot] Cannot sell ${position.tokenMint.slice(0, 8)}... - no token account found`
+          );
+        }
+      } else {
+        // Bot just started - skip as before (likely loading existing positions)
+        console.warn(
+          `[Bot] Could not find pool for ${position.tokenMint.slice(0, 8)}... - skipping (bot recently started)`,
+        );
+      }
+      
       this.releaseApiKey(tokenMint);
       this.positionTracker.removePosition(tokenMint);
       return;
